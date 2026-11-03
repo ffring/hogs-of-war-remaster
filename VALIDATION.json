@@ -56,5 +56,17 @@
     "two_computer_match_tested": false,
     "tailscale_connection_tested": false
   },
-  "game_executable_or_full_archives_bundled": false
+  "game_executable_or_full_archives_bundled": false,
+  "native_body_experiment": {
+    "installed": false,
+    "physical_game_tested": false,
+    "asi_sha256": "97e58e9029db4f3d427e39b7529f13d358c31eb876d400b737bac117b2bafcf7",
+    "production_input_fixture_groups": 13,
+    "bridge_fixture_groups": 6,
+    "release_asi_load": "passed",
+    "retail_instruction_fragment_policy_packet_cases": 16,
+    "free_vertical_walking_view": false,
+    "multiplayer_mouse_acceptance": false,
+    "source": "experiments/native-body"
+  }
 }
