@@ -11,6 +11,13 @@ typedef struct {
     uint8_t require_event_release; /* previously event-held across focus/UI reset */
 } HMButtonState;
 
+/* Free-aim mode proved too easy to leave active accidentally. Keep reading
+   the old INI key for compatibility, but always require the RMB gesture. */
+static inline int hm_normalize_require_rmb(int configured) {
+    (void)configured;
+    return 1;
+}
+
 static inline void hm_button_state_clear(HMButtonState *s) {
     s->known = s->held = s->pressed = s->require_event_release = 0;
 }
@@ -60,21 +67,49 @@ static inline uint16_t hm_button_state_take_fire(HMButtonState *s) {
     return result;
 }
 
+/* Convert one selected input-frame delta into at most one key pulse per axis.
+   Only a signed sub-threshold remainder survives. A reversal discards the
+   fraction accumulated in the old direction before considering this frame. */
+static inline int hm_aim_axis_pulse(int32_t frame_delta, int32_t *remainder,
+                                    int sensitivity) {
+    if (sensitivity < 1) sensitivity = 1;
+    if (frame_delta > 0 && *remainder < 0) *remainder = 0;
+    else if (frame_delta < 0 && *remainder > 0) *remainder = 0;
+
+    int64_t total = (int64_t)frame_delta + *remainder;
+    if (total >= sensitivity) {
+        *remainder = (int32_t)(total % sensitivity);
+        return 1;
+    }
+    if (total <= -sensitivity) {
+        *remainder = (int32_t)(total % sensitivity);
+        return -1;
+    }
+    *remainder = (int32_t)total;
+    return 0;
+}
+
 static inline uint16_t hm_read_aim(HMState *s, uint32_t now_ms, int sensitivity,
                                    int invert_y, int require_right_button,
                                    int right_button_held) {
     uint16_t out = 0;
     if (s->last_motion_ms && (uint32_t)(now_ms - s->last_motion_ms) > 100)
-        s->dx = s->dy = 0;
+        s->dx = s->dy = s->remainder_dx = s->remainder_dy = 0;
     if (require_right_button && !right_button_held) {
-        s->dx = s->dy = 0;
+        s->dx = s->dy = s->remainder_dx = s->remainder_dy = 0;
         return 0;
     }
-    if (s->dx >= sensitivity) { out |= HM_RIGHT; s->dx -= sensitivity; }
-    else if (s->dx <= -sensitivity) { out |= HM_LEFT; s->dx += sensitivity; }
-    if (s->dy >= sensitivity) { out |= invert_y ? HM_UP : HM_DOWN; s->dy -= sensitivity; }
-    else if (s->dy <= -sensitivity) { out |= invert_y ? HM_DOWN : HM_UP; s->dy += sensitivity; }
-    if (out & (HM_UP | HM_DOWN | HM_LEFT | HM_RIGHT)) out |= HM_L1;
+    /* L1 is the game's hold-to-aim/camera modifier, so it stays down for
+       every valid read in the active gesture, including a stationary frame. */
+    out |= HM_L1;
+    int32_t frame_dx = s->dx, frame_dy = s->dy;
+    s->dx = s->dy = 0; /* Never carry whole directional steps across reads. */
+    int x = hm_aim_axis_pulse(frame_dx, &s->remainder_dx, sensitivity);
+    int y = hm_aim_axis_pulse(frame_dy, &s->remainder_dy, sensitivity);
+    if (x > 0) out |= HM_RIGHT;
+    else if (x < 0) out |= HM_LEFT;
+    if (y > 0) out |= invert_y ? HM_UP : HM_DOWN;
+    else if (y < 0) out |= invert_y ? HM_DOWN : HM_UP;
     return out;
 }
 

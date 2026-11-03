@@ -29,11 +29,12 @@ static HWND g_hwnd;
 static DWORD g_game_thread;
 static int g_installed, g_raw_registered, g_enabled = 1, g_cfg_loaded, g_armed, g_f6_down, g_focused;
 static int g_initializing, g_permanent_failure;
-static int g_sensitivity = 4, g_invert_y, g_require_rmb;
+static int g_sensitivity = 4, g_invert_y, g_require_rmb = 1;
 static HMState g_mouse;
 static HMState g_legacy_mouse;
 static HMPollState g_poll_mouse;
 static HMButtonState g_button_state;
+static int g_aim_source;
 static DWORD g_last_game_input_ms;
 static DWORD g_raw_event_ms, g_legacy_event_ms;
 static LONG g_raw_seen, g_legacy_active, g_legacy_baseline;
@@ -53,6 +54,7 @@ static volatile LONG d_poll_sample, d_poll_motion, d_poll_buttons, d_poll_warp, 
 static volatile LONG d_poll_x, d_poll_y, d_poll_held;
 static volatile LONG d_raw_l_down, d_raw_l_up, d_raw_r_down, d_raw_r_up;
 static volatile LONG d_legacy_l_down, d_legacy_l_up, d_legacy_r_down, d_legacy_r_up;
+static volatile LONG d_aim_up, d_aim_down, d_aim_left, d_aim_right, d_aim_l1, d_aim_rmb_gated;
 static DWORD d_report_at;
 #define DIAG_INC(name) InterlockedIncrement(&d_##name)
 #ifndef HOGSMOUSE_TEST
@@ -64,6 +66,8 @@ static int WINAPI mouse_get(LPMSG, HWND, UINT, UINT);
 static void patch_iat(void **, void *);
 static int keyboard_callsite_owned(void);
 static int game_ui_active(void);
+static void reset_aim_motion(void);
+static void record_button_event(uint8_t button, int down);
 #ifdef HOGSMOUSE_TEST
 static DWORD g_test_now;
 static uint8_t g_test_buttons;
@@ -122,7 +126,7 @@ static void report_diagnostics(void) {
     if (nr != (UINT)-1) for (UINT i = 0; i < nr; ++i)
         if (regs[i].usUsagePage == 1 && regs[i].usUsage == 2) { found++; raw_hwnd = regs[i].hwndTarget; raw_flags = regs[i].dwFlags; }
     int written = snprintf(line, sizeof(line),
-        "DIAG3s peek=%ld get=%ld cb=%ld cbOtherThread=%ld cbUI=%ld cbAL0=%ld raw=%ld gates(disabled=%ld focus=%ld foreground=%ld noCB=%ld stale=%ld UI=%ld) readFail=%ld nonmouse=%ld abs=%ld disarmed=%ld noRMB=%ld zero=%ld rel=%ld buttons=%ld rawFlags(L+%ld L-%ld R+%ld R-%ld) legacy=%ld legacyIgnoredRaw=%ld legacyFlags(L+%ld L-%ld R+%ld R-%ld) merge=%ld invalidBind=%ld rebind=%ld rebindFail=%ld poll(sample=%ld motion=%ld buttons=%ld warp=%ld fail=%ld chosen=%ld xy=%d,%d held=%02x) rawReg(local=%d found=%u target=%p flags=%08lx match=%ld) callsiteOwned=%d prior=%p subclassHook=%d state(en=%d focus=%d fg=%d macFocus=%d armed=%d rawAge=%lu rawSeen=%ld legacyActive=%ld heldRaw=%02x heldLegacy=%02x heldPoll=%02x buttonHeld=%02x buttonKnown=%02x waitRelease=%02x dxRaw=%d dyRaw=%d dxLegacy=%d dyLegacy=%d dxPoll=%d dyPoll=%d cbAge=%lu gameHwnd=%p winTid=%lu tid=%lu/%lu)",
+        "DIAG3s peek=%ld get=%ld cb=%ld cbOtherThread=%ld cbUI=%ld cbAL0=%ld raw=%ld gates(disabled=%ld focus=%ld foreground=%ld noCB=%ld stale=%ld UI=%ld) readFail=%ld nonmouse=%ld abs=%ld disarmed=%ld noRMB=%ld zero=%ld rel=%ld buttons=%ld rawFlags(L+%ld L-%ld R+%ld R-%ld) legacy=%ld legacyIgnoredRaw=%ld legacyFlags(L+%ld L-%ld R+%ld R-%ld) merge=%ld invalidBind=%ld aim(U=%ld D=%ld L=%ld R=%ld L1=%ld gated=%ld) rebind=%ld rebindFail=%ld poll(sample=%ld motion=%ld buttons=%ld warp=%ld fail=%ld chosen=%ld xy=%d,%d held=%02x) rawReg(local=%d found=%u target=%p flags=%08lx match=%ld) callsiteOwned=%d prior=%p subclassHook=%d state(en=%d focus=%d fg=%d macFocus=%d armed=%d rawAge=%lu rawSeen=%ld legacyActive=%ld heldRaw=%02x heldLegacy=%02x heldPoll=%02x buttonHeld=%02x buttonKnown=%02x waitRelease=%02x dxRaw=%d dyRaw=%d dxLegacy=%d dyLegacy=%d dxPoll=%d dyPoll=%d cbAge=%lu gameHwnd=%p winTid=%lu tid=%lu/%lu)",
         InterlockedExchange(&d_peek, 0), InterlockedExchange(&d_get, 0), InterlockedExchange(&d_callback, 0),
         InterlockedExchange(&d_callback_thread, 0), InterlockedExchange(&d_callback_ui, 0),
         InterlockedExchange(&d_callback_ok0, 0), InterlockedExchange(&d_wm_input, 0),
@@ -139,6 +143,9 @@ static void report_diagnostics(void) {
         InterlockedExchange(&d_legacy_l_down, 0), InterlockedExchange(&d_legacy_l_up, 0),
         InterlockedExchange(&d_legacy_r_down, 0), InterlockedExchange(&d_legacy_r_up, 0),
         InterlockedExchange(&d_merge_added, 0), InterlockedExchange(&d_merge_invalid_bind, 0),
+        InterlockedExchange(&d_aim_up, 0), InterlockedExchange(&d_aim_down, 0),
+        InterlockedExchange(&d_aim_left, 0), InterlockedExchange(&d_aim_right, 0),
+        InterlockedExchange(&d_aim_l1, 0), InterlockedExchange(&d_aim_rmb_gated, 0),
         InterlockedExchange(&d_rebinds, 0), InterlockedExchange(&d_rebind_fail, 0),
         InterlockedExchange(&d_poll_sample, 0), InterlockedExchange(&d_poll_motion, 0),
         InterlockedExchange(&d_poll_buttons, 0), InterlockedExchange(&d_poll_warp, 0),
@@ -249,11 +256,24 @@ static BOOL register_mouse(HWND hwnd) {
     return TRUE;
 }
 
-static void clear_and_disarm(const char *reason) {
-    hm_button_disarm(&g_button_state);
+static void reset_aim_motion(void) {
     hm_clear(&g_mouse);
     hm_clear(&g_legacy_mouse);
     hm_poll_reset(&g_poll_mouse);
+    g_legacy_baseline = 0;
+    g_aim_source = HM_SOURCE_NONE;
+}
+
+static void record_button_event(uint8_t button, int down) {
+    uint8_t before = g_button_state.held;
+    hm_button_event(&g_button_state, button, down);
+    if (button == HM_MOUSE_RIGHT && ((before ^ g_button_state.held) & HM_MOUSE_RIGHT))
+        reset_aim_motion();
+}
+
+static void clear_and_disarm(const char *reason) {
+    hm_button_disarm(&g_button_state);
+    reset_aim_motion();
     g_raw_seen = g_legacy_active = g_legacy_baseline = 0;
     g_raw_event_ms = g_legacy_event_ms = 0;
     g_armed = 0;
@@ -297,6 +317,7 @@ static int sync_button_poll(void) {
     BYTE before = g_button_state.held;
     hm_button_poll(&g_button_state, physical_buttons_down_mask());
     if (before != g_button_state.held) DIAG_INC(poll_buttons);
+    if ((before ^ g_button_state.held) & HM_MOUSE_RIGHT) reset_aim_motion();
     return hm_button_state_released(&g_button_state);
 }
 
@@ -405,10 +426,10 @@ static void process_legacy_mouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
        helper makes duplicate Raw/legacy edges idempotent, and a legacy UP is
        still useful if Raw Input stopped owning the process registration. */
     if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP) {
-        if (msg == WM_LBUTTONDOWN) { if (active) hm_button_event(&g_button_state, HM_MOUSE_LEFT, 1); DIAG_INC(legacy_l_down); }
-        else if (msg == WM_LBUTTONUP) { hm_button_event(&g_button_state, HM_MOUSE_LEFT, 0); DIAG_INC(legacy_l_up); }
-        else if (msg == WM_RBUTTONDOWN) { if (active) hm_button_event(&g_button_state, HM_MOUSE_RIGHT, 1); DIAG_INC(legacy_r_down); }
-        else { hm_button_event(&g_button_state, HM_MOUSE_RIGHT, 0); DIAG_INC(legacy_r_up); }
+        if (msg == WM_LBUTTONDOWN) { if (active) record_button_event(HM_MOUSE_LEFT, 1); DIAG_INC(legacy_l_down); }
+        else if (msg == WM_LBUTTONUP) { record_button_event(HM_MOUSE_LEFT, 0); DIAG_INC(legacy_l_up); }
+        else if (msg == WM_RBUTTONDOWN) { if (active) record_button_event(HM_MOUSE_RIGHT, 1); else reset_aim_motion(); DIAG_INC(legacy_r_down); }
+        else { record_button_event(HM_MOUSE_RIGHT, 0); DIAG_INC(legacy_r_up); }
         if (!g_armed && g_enabled && g_focused && is_game_foreground() && !game_ui_active() && hm_button_state_released(&g_button_state)) g_armed = 1;
         if (!active) return;
         if (raw_fresh) { DIAG_INC(legacy_ignored_raw); return; }
@@ -425,8 +446,8 @@ static void process_legacy_mouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     g_legacy_event_ms = now;
     if (msg == WM_MOUSEMOVE) {
-        hm_button_event(&g_button_state, HM_MOUSE_LEFT, (wp & MK_LBUTTON) != 0);
-        hm_button_event(&g_button_state, HM_MOUSE_RIGHT, (wp & MK_RBUTTON) != 0);
+        record_button_event(HM_MOUSE_LEFT, (wp & MK_LBUTTON) != 0);
+        record_button_event(HM_MOUSE_RIGHT, (wp & MK_RBUTTON) != 0);
         SHORT x = (SHORT)LOWORD(lp), y = (SHORT)HIWORD(lp);
         if (!g_legacy_baseline) {
             g_legacy_x = x; g_legacy_y = y; g_legacy_baseline = 1;
@@ -476,10 +497,11 @@ static void monitor_game_window(void) {
 }
 
 static void apply_raw_button_flags(USHORT flags, int allow_down) {
-    if ((flags & RI_MOUSE_LEFT_BUTTON_DOWN) && allow_down) { hm_button_event(&g_button_state, HM_MOUSE_LEFT, 1); DIAG_INC(raw_l_down); }
-    if (flags & RI_MOUSE_LEFT_BUTTON_UP) { hm_button_event(&g_button_state, HM_MOUSE_LEFT, 0); DIAG_INC(raw_l_up); }
-    if ((flags & RI_MOUSE_RIGHT_BUTTON_DOWN) && allow_down) { hm_button_event(&g_button_state, HM_MOUSE_RIGHT, 1); DIAG_INC(raw_r_down); }
-    if (flags & RI_MOUSE_RIGHT_BUTTON_UP) { hm_button_event(&g_button_state, HM_MOUSE_RIGHT, 0); DIAG_INC(raw_r_up); }
+    if ((flags & RI_MOUSE_LEFT_BUTTON_DOWN) && allow_down) { record_button_event(HM_MOUSE_LEFT, 1); DIAG_INC(raw_l_down); }
+    if (flags & RI_MOUSE_LEFT_BUTTON_UP) { record_button_event(HM_MOUSE_LEFT, 0); DIAG_INC(raw_l_up); }
+    if ((flags & RI_MOUSE_RIGHT_BUTTON_DOWN) && allow_down) { record_button_event(HM_MOUSE_RIGHT, 1); DIAG_INC(raw_r_down); }
+    if (flags & RI_MOUSE_RIGHT_BUTTON_UP) { record_button_event(HM_MOUSE_RIGHT, 0); DIAG_INC(raw_r_up); }
+    if ((flags & (RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_UP)) && !allow_down) reset_aim_motion();
     if (flags) DIAG_INC(button_events);
     if (!g_armed && g_enabled && g_focused && is_game_foreground() && !game_ui_active() && hm_button_state_released(&g_button_state)) g_armed = 1;
 }
@@ -561,13 +583,30 @@ static int merge_mouse(BYTE *buf, BYTE *user) {
     int source = hm_poll_choose_source(g_raw_registered && g_raw_registration_matches,
         g_raw_seen, g_raw_event_ms, g_legacy_active, g_legacy_event_ms,
         g_poll_mouse.sample_valid, now);
+    /* A source change ends the previous gesture: never carry sub-step
+       movement from Raw Input into legacy/poll, or vice versa. */
+    if (source != g_aim_source) {
+        g_mouse.remainder_dx = g_mouse.remainder_dy = 0;
+        g_legacy_mouse.remainder_dx = g_legacy_mouse.remainder_dy = 0;
+        g_poll_mouse.mouse.remainder_dx = g_poll_mouse.mouse.remainder_dy = 0;
+        g_aim_source = source;
+    }
     if (source == HM_SOURCE_POLL) DIAG_INC(poll_chosen);
     HMState *state = source == HM_SOURCE_RAW ? &g_mouse :
                      source == HM_SOURCE_LEGACY ? &g_legacy_mouse :
                      source == HM_SOURCE_POLL ? &g_poll_mouse.mouse : NULL;
+    HMState no_motion = {0};
     uint16_t mask = hm_button_state_take_fire(&g_button_state);
-    if (state) mask |= hm_read_aim(state, now, g_sensitivity, g_invert_y,
+    HMState *aim_state = state ? state : &no_motion;
+    uint16_t aim = hm_read_aim(aim_state, now, g_sensitivity, g_invert_y,
         g_require_rmb, (g_button_state.held & HM_MOUSE_RIGHT) != 0);
+    mask |= aim;
+    if (aim & HM_UP) DIAG_INC(aim_up);
+    if (aim & HM_DOWN) DIAG_INC(aim_down);
+    if (aim & HM_LEFT) DIAG_INC(aim_left);
+    if (aim & HM_RIGHT) DIAG_INC(aim_right);
+    if (aim & HM_L1) DIAG_INC(aim_l1);
+    else if (g_require_rmb) DIAG_INC(aim_rmb_gated);
     if (state != &g_mouse) g_mouse.dx = g_mouse.dy = 0;
     if (state != &g_legacy_mouse) g_legacy_mouse.dx = g_legacy_mouse.dy = 0;
     if (state != &g_poll_mouse.mouse) g_poll_mouse.mouse.dx = g_poll_mouse.mouse.dy = 0;
@@ -610,7 +649,7 @@ static BYTE __cdecl chained_kb_state(BYTE *buf, BYTE *user) {
     }
     if (g_last_game_input_ms && (uint32_t)(now - g_last_game_input_ms) > 100) {
         hm_button_disarm(&g_button_state);
-        hm_clear(&g_mouse); hm_clear(&g_legacy_mouse); hm_poll_reset(&g_poll_mouse); g_raw_seen = g_legacy_active = g_legacy_baseline = 0;
+        reset_aim_motion(); g_raw_seen = g_legacy_active = g_legacy_baseline = 0;
         g_armed = physical_buttons_up();
     }
     g_last_game_input_ms = now;
@@ -681,7 +720,10 @@ static void load_config(void) {
     if (g_sensitivity < 1) g_sensitivity = 1;
     if (g_sensitivity > 64) g_sensitivity = 64;
     g_invert_y = GetPrivateProfileIntA("Mouse", "InvertY", 0, ini) != 0;
-    g_require_rmb = GetPrivateProfileIntA("Mouse", "RequireRightButton", 0, ini) != 0;
+    int configured_rmb = GetPrivateProfileIntA("Mouse", "RequireRightButton", 1, ini) != 0;
+    g_require_rmb = hm_normalize_require_rmb(configured_rmb);
+    if (!configured_rmb)
+        log_line("RequireRightButton=0 is an old free-aim setting and is ignored; hold the right mouse button to aim.");
     if (GetPrivateProfileIntA("Mouse", "CaptureCursor", 0, ini))
         log_line("CaptureCursor is reserved and unsupported; cursor remains free.");
     g_cfg_loaded = 1;
@@ -700,7 +742,7 @@ void hm_test_reset_state(void) {
     g_initializing = g_permanent_failure = g_f6_down = 0;
     g_test_now = 1000; g_test_buttons = 0; g_test_foreground = 1; g_test_native_focus = 1; g_test_ui = 0; g_test_old_calls = 0;
     g_test_cursor_x = 100; g_test_cursor_y = 100; g_test_cursor_valid = 1;
-    g_last_game_input_ms = 1000; g_sensitivity = 4; g_invert_y = 0; g_require_rmb = 0;
+    g_last_game_input_ms = 1000; g_sensitivity = 4; g_invert_y = 0; g_require_rmb = 1; g_aim_source = HM_SOURCE_NONE;
     g_raw_registered = g_raw_seen = g_legacy_active = g_legacy_baseline = 0;
     g_raw_registration_matches = 0; g_raw_registration_verified = 0; g_raw_registration_check_at = 0;
     g_test_raw_registration_match = 1; d_raw_read_fail = 0; g_test_msg_mutations = 0;
@@ -709,7 +751,7 @@ void hm_test_reset_state(void) {
 void hm_test_set_now(DWORD now) { g_test_now = now; }
 void hm_test_set_buttons(BYTE buttons) { g_test_buttons = buttons; }
 void hm_test_set_raw_registration_match(int matches) { g_test_raw_registration_match = matches != 0; }
-void hm_test_set_require_rmb(int enabled) { g_require_rmb = enabled != 0; }
+void hm_test_set_require_rmb(int enabled) { g_require_rmb = hm_normalize_require_rmb(enabled); }
 void hm_test_set_cursor(LONG x, LONG y, int valid) { g_test_cursor_x=x; g_test_cursor_y=y; g_test_cursor_valid=valid; }
 BYTE hm_test_poll_held(void) { return g_poll_mouse.mouse.held; }
 int hm_test_poll_dx(void) { return g_poll_mouse.mouse.dx; }
@@ -816,7 +858,7 @@ static void try_initialize(void) {
     FlushInstructionCache(GetCurrentProcess(), site, 5);
     VirtualProtect(site, 5, old, &old);
     g_installed = 1; g_armed = physical_buttons_up();
-    log_line(g_require_rmb ? "Mouse control installed; hold right mouse to aim, left mouse to fire; F6 toggles." : "Mouse control installed; move mouse to aim, left mouse to fire; active by default, F6 optional.");
+    log_line("Mouse control installed; hold right mouse to aim, left mouse to fire; F6 toggles.");
 done:
     g_initializing = 0;
 #endif
@@ -834,7 +876,7 @@ static void poll_control_state(void) {
     sync_button_poll();
     if (g_last_game_input_ms && (uint32_t)(now_ms() - g_last_game_input_ms) > 100) {
         hm_button_disarm(&g_button_state);
-        hm_clear(&g_mouse); hm_clear(&g_legacy_mouse); hm_poll_reset(&g_poll_mouse); g_raw_seen = g_legacy_active = g_legacy_baseline = 0;
+        reset_aim_motion(); g_raw_seen = g_legacy_active = g_legacy_baseline = 0;
         g_last_game_input_ms = 0;
         g_armed = 0;
     }

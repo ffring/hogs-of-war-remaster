@@ -81,6 +81,7 @@ static BYTE read_frame(BYTE *buf, BYTE *user) {
     return hm_test_run_callback(buf, user);
 }
 static int hasaim(const BYTE *b) { return (b[0x20] & 0x80) && (b[0x1d] & 0x80); }
+static int has_direction(const BYTE *b) { return (b[0x20] & 0x80) || (b[0x1e] & 0x80) || (b[0x21] & 0x80) || (b[0x22] & 0x80); }
 
 int main(void) {
     BYTE buf[256], user[0x128]; memset(buf, 0, sizeof(buf)); memset(user, 0, sizeof(user)); set_bindings(user);
@@ -89,12 +90,47 @@ int main(void) {
         return fail("prior HogsFix stub ABI/EDI/result");
     puts("PASS prior stub ABI called once: stack buffer, EDI player, EDI/result preserved");
 
-    /* Default free aim: pointer movement reaches battle bindings with RMB up. */
-    hm_test_reset_state(); hm_test_set_require_rmb(0); hm_test_set_buttons(0);
-    hm_test_set_cursor(100,100,1); read_frame(buf,user);
-    hm_test_set_cursor(108,100,1);
-    if (read_frame(buf,user) == 0x5a || !hasaim(buf)) return fail("free aim without right-button modifier");
-    puts("PASS free aim maps cursor movement without holding RMB");
+    /* Default controlled aim: L1 stays held through stationary reads while
+       RMB is down; each read consumes its frame motion, and UP clears it. */
+    hm_test_reset_state(); hm_test_set_require_rmb(1); hm_test_set_buttons(0);
+    hm_test_raw_button_event(RI_MOUSE_RIGHT_BUTTON_DOWN);
+    hm_test_raw_motion(4,0);
+    if (read_frame(buf,user) == 0x5a || !hasaim(buf)) return fail("RMB frame delta did not add RIGHT+L1");
+    if (read_frame(buf,user) == 0x5a || (buf[0x1d]&0x80)==0 || (buf[0x20]&0x80))
+        return fail("stationary RMB read did not hold only L1");
+    hm_test_raw_button_event(RI_MOUSE_RIGHT_BUTTON_UP);
+    read_frame(buf,user);
+    if ((buf[0x1d]&0x80) || (buf[0x20]&0x80))
+        return fail("RMB UP did not immediately clear L1 and arrows");
+    puts("PASS default controlled aim: stationary RMB holds L1; release clears L1 and aim");
+
+    /* Subthreshold motion only retains a signed fraction; reversal discards
+       the prior fraction. There is no direction pulse when the mouse is idle. */
+    hm_test_reset_state(); hm_test_raw_button_event(RI_MOUSE_RIGHT_BUTTON_DOWN);
+    hm_test_raw_motion(1,0); read_frame(buf,user);
+    if ((buf[0x1d]&0x80)==0 || (buf[0x20]&0x80)) return fail("subthreshold motion generated a key");
+    hm_test_set_now(1010); hm_test_raw_motion(-1,0); read_frame(buf,user);
+    hm_test_set_now(1020); hm_test_raw_motion(1,0); read_frame(buf,user);
+    if ((buf[0x20]&0x80) || (buf[0x1d]&0x80)==0) return fail("tiny alternating deltas emitted aim key");
+    puts("PASS tiny alternating Raw deltas do not create a direction pulse");
+
+    /* Large frames yield one pulse only. A fresh reversal never inherits a
+       queued direction from earlier fast motion. */
+    hm_test_reset_state(); hm_test_raw_button_event(RI_MOUSE_RIGHT_BUTTON_DOWN);
+    hm_test_raw_motion(7,0);
+    if (read_frame(buf,user) == 0x5a || !hasaim(buf)) return fail("fast frame missing single right pulse");
+    hm_test_set_now(1010); hm_test_raw_motion(-1,0); read_frame(buf,user);
+    if ((buf[0x20]&0x80) || (buf[0x1d]&0x80)==0) return fail("reversal inherited prior direction debt");
+    hm_test_set_now(1020); read_frame(buf,user);
+    if ((buf[0x20]&0x80) || (buf[0x1d]&0x80)==0) return fail("idle read continued aim direction");
+    puts("PASS fast-to-slow reversal and idle do not replay directional backlog");
+
+    /* A stale INI opt-out is normalized by the same policy used by
+       load_config, so old free-aim settings cannot inject while idle. */
+    hm_test_reset_state(); hm_test_set_require_rmb(0); hm_test_raw_motion(4,0);
+    if (read_frame(buf,user) != 0x5a || has_direction(buf) || (buf[0x1d]&0x80))
+        return fail("legacy RequireRightButton=0 bypassed the RMB gate");
+    puts("PASS legacy RequireRightButton=0 cannot enable idle free aim");
 
     /* Raw LMB remains authoritative despite async polling zero, including a
        stationary one-second charge, and an actual UP ends it. */
@@ -141,11 +177,12 @@ int main(void) {
     /* Raw owns movement while recent: sampled screen delta is discarded and
        cannot replay when Raw ages out. */
     hm_test_reset_state(); hm_test_set_buttons(0); hm_test_set_cursor(200,200,1); read_frame(buf,user);
+    hm_test_raw_button_event(RI_MOUSE_RIGHT_BUTTON_DOWN);
     hm_test_raw_motion(4,0); hm_test_set_cursor(212,200,1);
     if (read_frame(buf,user) == 0x5a || !hasaim(buf) || hm_test_poll_dx()!=0) return fail("fresh Raw movement or poll-delta suppression");
     for (DWORD t=1050; t<=1300; t+=50) { hm_test_set_now(t); hm_test_set_cursor(212,200,1); read_frame(buf,user); }
-    if (hasaim(buf) || hm_test_mouse_dx()!=0) return fail("stale unselected motion replayed after Raw expiry");
-    puts("PASS one movement source only; poll movement sampled during Raw ownership does not replay later");
+    if (has_direction(buf) || (buf[0x1d]&0x80)==0 || hm_test_mouse_dx()!=0) return fail("stale unselected motion replayed after Raw expiry or RMB L1 dropped");
+    puts("PASS one movement source only; poll movement is discarded and held RMB keeps L1 after Raw expires");
 
     /* UI transition clears held/pending mouse state and injects no mouse keys. */
     hm_test_reset_state(); hm_test_raw_button_event(RI_MOUSE_LEFT_BUTTON_DOWN);

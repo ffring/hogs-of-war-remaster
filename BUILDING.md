@@ -30,8 +30,8 @@ The ASI targets 32-bit Windows, including the validated 32-bit Steam executable 
 
 ```sh
 zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -Isrc/mouse -Wl,--strip-all -shared -o HogsMouse.asi src/mouse/HogsMouse.c -luser32 -lkernel32
-zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -DHOGSMOUSE_TEST -Isrc/mouse -o free_aim_harness.exe src/mouse/HogsMouse.c tests/mouse/free_aim_harness.c -luser32 -lkernel32
-cc -std=c11 -O2 -Isrc/mouse tests/mouse/free_aim_policy_test.c -o free_aim_policy_test
+zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -DHOGSMOUSE_TEST -Isrc/mouse -o controlled_aim_harness.exe src/mouse/HogsMouse.c tests/mouse/controlled_aim_harness.c -luser32 -lkernel32
+cc -std=c11 -O2 -Isrc/mouse tests/mouse/controlled_aim_policy_test.c -o controlled_aim_policy_test
 ```
 
 The candidate is not installed by the 0.5 release. On macOS it also requires the native focus publisher and matching launcher wiring described in `src/native/README.md`; copying only the ASI is insufficient for the complete Mac focus protection.

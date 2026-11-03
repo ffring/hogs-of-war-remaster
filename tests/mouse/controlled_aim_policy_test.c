@@ -9,12 +9,49 @@ int main(void) {
     HMButtonState b = {0};
     HMState aim = {0};
 
-    /* Free aim maps cursor movement with no RMB held. */
-    hm_motion(&aim, 8, 0, 100);
-    uint16_t out = hm_read_aim(&aim, 100, 4, 0, 0, 0);
-    if ((out & (HM_RIGHT | HM_L1)) != (HM_RIGHT | HM_L1) || aim.dx != 4)
-        return fail("free aim without right-button hold");
-    puts("PASS free aim maps delta while RMB is up");
+    /* Default controlled aim holds L1 for the whole RMB gesture, even while
+       stationary; each read consumes motion and cannot replay a whole step. */
+    hm_motion(&aim, 4, 0, 100);
+    uint16_t out = hm_read_aim(&aim, 100, 4, 0, 1, 1);
+    if ((out & (HM_RIGHT | HM_L1)) != (HM_RIGHT | HM_L1) || aim.dx != 0)
+        return fail("RMB frame delta maps one right pulse with L1");
+    out = hm_read_aim(&aim, 101, 4, 0, 1, 1);
+    if (out != HM_L1) return fail("stationary held RMB lost L1 or repeated aim");
+    out = hm_read_aim(&aim, 102, 4, 0, 1, 0);
+    if (out != 0 || aim.remainder_dx || aim.dx) return fail("RMB release did not clear aim debt");
+    puts("PASS stationary RMB holds L1; frame delta emits one pulse and release clears debt");
+
+    memset(&aim, 0, sizeof(aim));
+    hm_motion(&aim, 1, 0, 200); out = hm_read_aim(&aim, 200, 4, 0, 1, 1);
+    if (out != HM_L1 || aim.remainder_dx != 1) return fail("subthreshold fraction retained");
+    hm_motion(&aim, -1, 0, 201); out = hm_read_aim(&aim, 201, 4, 0, 1, 1);
+    if (out != HM_L1 || aim.remainder_dx != -1) return fail("direction reversal kept stale fraction");
+    hm_motion(&aim, 1, 0, 202); out = hm_read_aim(&aim, 202, 4, 0, 1, 1);
+    if (out != HM_L1 || aim.remainder_dx != 1) return fail("alternating tiny deltas pulsed");
+    puts("PASS tiny alternating deltas keep only signed subthreshold remainder");
+
+    memset(&aim, 0, sizeof(aim));
+    hm_motion(&aim, 32, 0, 300); out = hm_read_aim(&aim, 300, 4, 0, 1, 1);
+    if ((out & (HM_RIGHT | HM_L1)) != (HM_RIGHT | HM_L1) || aim.dx || aim.remainder_dx)
+        return fail("large frame generated more than one pulse or carried full-step debt");
+    out = hm_read_aim(&aim, 301, 4, 0, 1, 1);
+    if (out != HM_L1) return fail("large-frame direction continued while idle");
+    puts("PASS large frame pulses once; idle stops; reversal does not inherit step debt");
+
+    memset(&aim, 0, sizeof(aim));
+    hm_motion(&aim, 7, 0, 350); out = hm_read_aim(&aim, 350, 4, 0, 1, 1);
+    if ((out & (HM_RIGHT | HM_L1)) != (HM_RIGHT | HM_L1) || aim.remainder_dx != 3)
+        return fail("fast movement did not retain only a subthreshold fraction");
+    hm_motion(&aim, -1, 0, 351); out = hm_read_aim(&aim, 351, 4, 0, 1, 1);
+    if (out != HM_L1 || aim.remainder_dx != -1) return fail("slow reversal inherited forward debt");
+    puts("PASS fast-to-slow reversal discards old-direction fraction");
+
+    memset(&aim, 0, sizeof(aim));
+    if (!hm_normalize_require_rmb(0)) return fail("legacy free-aim INI was not normalized to RMB-required");
+    hm_motion(&aim, 4, 0, 400);
+    out = hm_read_aim(&aim, 400, 4, 0, hm_normalize_require_rmb(0), 0);
+    if (out != 0 || aim.dx || aim.remainder_dx) return fail("legacy free-aim INI injected without RMB");
+    puts("PASS legacy RequireRightButton=0 is normalized; no idle aim without RMB");
 
     /* Raw down is authoritative over async poll zero and stationary for >1s. */
     hm_button_event(&b, HM_MOUSE_LEFT, 1);

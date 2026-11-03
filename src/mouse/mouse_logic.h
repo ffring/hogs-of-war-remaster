@@ -45,6 +45,7 @@ static inline int hm_choose_source(int registered, int seen, uint32_t last_raw_m
 
 typedef struct {
     int32_t dx, dy;
+    int32_t remainder_dx, remainder_dy;
     uint32_t last_motion_ms;
     uint8_t held, pressed;
 } HMState;
@@ -54,7 +55,7 @@ static inline int32_t hm_clamp_delta(int64_t n) {
 }
 
 static inline void hm_clear(HMState *s) {
-    s->dx = s->dy = 0;
+    s->dx = s->dy = s->remainder_dx = s->remainder_dy = 0;
     s->held = 0;
     s->pressed = 0;
     s->last_motion_ms = 0;
@@ -79,25 +80,6 @@ static inline void hm_motion(HMState *s, int32_t dx, int32_t dy, uint32_t now_ms
     s->dx = hm_clamp_delta((int64_t)s->dx + dx);
     s->dy = hm_clamp_delta((int64_t)s->dy + dy);
     s->last_motion_ms = now_ms;
-}
-
-/* Consume at most one 4px (or configured) aiming step per battle input read. */
-static inline uint16_t hm_read_buttons(HMState *s, uint32_t now_ms, int sensitivity, int invert_y,
-                                       int require_right_button) {
-    uint16_t out = 0;
-    if (s->last_motion_ms && (uint32_t)(now_ms - s->last_motion_ms) > 100) s->dx = s->dy = 0;
-    if ((s->held | s->pressed) & HM_MOUSE_LEFT) out |= HM_CROSS;
-    s->pressed = 0;
-    if (!require_right_button || (s->held & HM_MOUSE_RIGHT)) {
-        if (s->dx >= sensitivity) { out |= HM_RIGHT; s->dx -= sensitivity; }
-        else if (s->dx <= -sensitivity) { out |= HM_LEFT; s->dx += sensitivity; }
-        if (s->dy >= sensitivity) { out |= invert_y ? HM_UP : HM_DOWN; s->dy -= sensitivity; }
-        else if (s->dy <= -sensitivity) { out |= invert_y ? HM_DOWN : HM_UP; s->dy += sensitivity; }
-        if (out & (HM_UP | HM_DOWN | HM_LEFT | HM_RIGHT)) out |= HM_L1;
-    } else {
-        s->dx = s->dy = 0;
-    }
-    return out;
 }
 
 /* Validate the entire requested mapping before touching the DirectInput image. */
