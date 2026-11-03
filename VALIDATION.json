@@ -58,7 +58,7 @@
   },
   "game_executable_or_full_archives_bundled": false,
   "native_body_experiment": {
-    "installed": false,
+    "installed": true,
     "physical_game_tested": false,
     "asi_sha256": "97e58e9029db4f3d427e39b7529f13d358c31eb876d400b737bac117b2bafcf7",
     "production_input_fixture_groups": 13,
@@ -67,6 +67,13 @@
     "retail_instruction_fragment_policy_packet_cases": 16,
     "free_vertical_walking_view": false,
     "multiplayer_mouse_acceptance": false,
-    "source": "experiments/native-body"
+    "source": "experiments/native-body",
+    "local_install_readback": "passed",
+    "game_launched_during_install": false,
+    "launchers_and_HD_profile_checks": "passed",
+    "protected_core_files": 10,
+    "original_archives": 140,
+    "HD_pages": 24,
+    "owner_game_test": "pending"
   }
 }

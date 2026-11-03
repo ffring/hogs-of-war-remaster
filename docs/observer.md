@@ -1,6 +1,6 @@
 # Bounded camera observer
 
-The optional mouse source currently preserves the experimental controlled-RMB input mapping and adds a diagnostic observer. It is installed on the owner machine for a manual test; the released 0.5 installers are unchanged. The requested mouse-controlled chase camera remains unimplemented.
+The source in `src/mouse` preserves the earlier controlled-RMB input mapping and adds a diagnostic observer. The owner used it to capture native arrow turns and camera/weapon modes. It has now been replaced locally by the native body-turn experiment under `experiments/native-body`, which retains the observer. The released 0.5 installers are unchanged; the new module awaits its first battle test.
 
 Sampling runs on the existing foreground human-input callback. It records at most 4,096 CSV rows per game process: game/camera mode, selected weapon, validated controller and active pig, pig position and heading, camera fields, synthetic button mask and six configured game-bound keys. It does not record arbitrary system keys or write camera/character memory. All observed game ranges are checked with VirtualQuery before reads. Camera and pig angles use signed 32-bit integer values; pig-heading interpretation additionally requires object type 0x1357.
 

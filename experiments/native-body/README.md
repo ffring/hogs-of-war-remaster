@@ -1,6 +1,6 @@
 # Native body-turn experiment
 
-This source is a staged experiment. It is not installed by the 0.5 test installers and has not been accepted in a real game. The owner currently has the observer module from `src/mouse` installed. No runtime logs or game executable are included here.
+This source is an experiment installed on the owner machine for a manual battle test. It is not included in the 0.5 test installers and has not been accepted in a real game. Installation/readback and launcher/profile checks passed with the game closed; no game was launched by the installer. No runtime logs or game executable are included here.
 
 Mouse X is packed into the original synchronized input record and the game applies native pig turning. The original mode-4 camera follows the pig, as observed in the owner keyboard trace. Holding RMB with a selected weapon retains the already tested digital aim-key path; unarmed RMB does not request the independent orbit camera. LMB remains native fire/charge/release. Free vertical view outside weapon aiming is not implemented. Actual multiplayer mouse behavior is unverified.
 
