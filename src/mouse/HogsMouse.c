@@ -11,6 +11,8 @@
 #include "message_pump_logic.h"
 #include "poll_logic.h"
 #include "button_state.h"
+#include "observer_read.h"
+#include "observer_buffer.h"
 
 /* Narrow compatibility target: Steam/GOG-compatible November 2000 warhogs_.exe,
    loaded at 0x400000. The call address is the game's preferred VA from HogsFix. */
@@ -42,6 +44,17 @@ static SHORT g_legacy_x, g_legacy_y;
 static LONG g_raw_registration_matches;
 static LONG g_raw_registration_verified;
 static DWORD g_raw_registration_check_at;
+/* Chase-camera observer: bounded, read-only state sampling. These fields do
+   not participate in control decisions or modify game memory. */
+static uint16_t g_observer_mouse_mask;
+#ifndef HOGSMOUSE_TEST
+enum { OBS_MAX_ROWS = 4096 };
+static HANDLE g_observer_file = INVALID_HANDLE_VALUE;
+static HogsObserverBatch g_observer_batch;
+static DWORD g_observer_last_flush;
+static DWORD g_observer_rows;
+static int g_observer_disabled;
+#endif
 /* Diagnostic-only counters for one human battle run. All increments/exchanges
    are atomic because a mismatched callback thread is itself a signal to log. */
 static volatile LONG d_peek, d_get, d_callback, d_callback_thread, d_callback_ui, d_callback_ok0;
@@ -66,6 +79,7 @@ static int WINAPI mouse_get(LPMSG, HWND, UINT, UINT);
 static void patch_iat(void **, void *);
 static int keyboard_callsite_owned(void);
 static int game_ui_active(void);
+static int is_game_foreground(void);
 static void reset_aim_motion(void);
 static void record_button_event(uint8_t button, int down);
 #ifdef HOGSMOUSE_TEST
@@ -115,6 +129,97 @@ static void log_line(const char *s) {
     CloseHandle(f);
 #endif
 }
+
+#ifndef HOGSMOUSE_TEST
+static int observer_write_all(HANDLE file, const void *bytes, DWORD count) {
+    const char *p = (const char *)bytes;
+    while (count) {
+        DWORD written = 0;
+        if (!WriteFile(file, p, count, &written, NULL) || !written) return 0;
+        p += written; count -= written;
+    }
+    return 1;
+}
+
+static int observer_file_sink(void *context, const char *bytes, size_t count) {
+    HANDLE file = (HANDLE)context;
+    return count <= 0xffffffffu && observer_write_all(file, bytes, (DWORD)count) && FlushFileBuffers(file);
+}
+
+static int observer_open(void) {
+    if (g_observer_file != INVALID_HANDLE_VALUE) return 1;
+    if (g_observer_disabled) return 0;
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) { g_observer_disabled = 1; return 0; }
+    while (n && path[n - 1] != '\\') --n;
+    if (!n) { g_observer_disabled = 1; return 0; }
+    char name[64];
+    for (DWORD attempt = 0; attempt < 32; ++attempt) {
+        int name_length = hogs_observer_make_filename(name, sizeof(name), GetCurrentProcessId(),
+                                                     GetTickCount(), attempt);
+        if (name_length < 0 || n + (DWORD)name_length + 1 > MAX_PATH) { g_observer_disabled = 1; return 0; }
+        memcpy(path + n, name, (size_t)name_length + 1);
+        g_observer_file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
+                                      FILE_ATTRIBUTE_NORMAL, NULL);
+        if (g_observer_file != INVALID_HANDLE_VALUE) break;
+        DWORD error = GetLastError();
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) break;
+    }
+    if (g_observer_file == INVALID_HANDLE_VALUE) { g_observer_disabled = 1; return 0; }
+    static const char header[] = "tick,user,user_ok,state,state_ok,battle,battle_ok,weapon,weapon_ok,controller,controller_ok,controller_matches_user,active_pig_ptr,active_pig_ptr_ok,active_pig_type,active_pig_type_ok,active_pig_heading_i32,active_pig_heading_ok,active_pig_transform_ptr,active_pig_transform_ptr_ok,active_pig_pos_x,active_pig_pos_y,active_pig_pos_z,active_pig_position_ok,camera,camera_ok,cam_mode,mode_ok,cam_s16_76,cam_u16_78,cam_u16_b4,cam_fields_ok,angle_88_i32,angle_8c_i32,angle_90_i32,angles_ok,target54_ptr,target54_ptr_ok,target54_type,target54_type_ok,target54_heading_i32,target54_heading_ok,targetb0_ptr,targetb0_ptr_ok,targetb0_type,targetb0_type_ok,targetb0_heading_i32,targetb0_heading_ok,buttons_held,buttons_known,raw_held,legacy_held,poll_held,mouse_mask,prior_ok,dik_valid,key_valid_mask,up_dik,down_dik,left_dik,right_dik,l1_dik,cross_dik,key_held_mask\r\n";
+    if (!observer_write_all(g_observer_file, header, sizeof(header) - 1)) {
+        CloseHandle(g_observer_file); g_observer_file = INVALID_HANDLE_VALUE; g_observer_disabled = 1; return 0;
+    }
+    g_observer_last_flush = GetTickCount();
+    return 1;
+}
+
+static void observer_flush(void) {
+    if (g_observer_file == INVALID_HANDLE_VALUE || !g_observer_batch.used) return;
+    if (!hogs_observer_batch_drain(&g_observer_batch, observer_file_sink, g_observer_file)) {
+        CloseHandle(g_observer_file); g_observer_file = INVALID_HANDLE_VALUE;
+        g_observer_disabled = 1; hogs_observer_batch_clear(&g_observer_batch); return;
+    }
+    g_observer_last_flush = GetTickCount();
+}
+
+static void observer_tick(BYTE *user, BYTE prior_ok, const HogsObserverInputKeys *input_keys) {
+    if (g_observer_disabled || g_observer_rows >= OBS_MAX_ROWS || !g_installed || !g_enabled ||
+        !g_armed || !g_focused || GetCurrentThreadId() != g_game_thread ||
+        !is_game_foreground() || game_ui_active() || !user) return;
+
+    HogsObserverSnapshot s;
+    hogs_observer_capture((uintptr_t)0x00537f24, (uintptr_t)0x00537f98,
+                          (uintptr_t)user, &s);
+    if (!(s.flags & OBS_USER_OK) || ((s.flags & OBS_CONTROLLER_OK) && !s.controller_matches_user)) return;
+
+    if (!observer_open()) return;
+    char row[HOGS_OBSERVER_ROW_BYTES];
+    HogsObserverRow record;
+    memset(&record, 0, sizeof(record));
+    record.tick = GetTickCount(); record.user_ptr = (uintptr_t)user; record.snapshot = s;
+    record.buttons_held = g_button_state.held; record.buttons_known = g_button_state.known;
+    record.raw_held = g_mouse.held; record.legacy_held = g_legacy_mouse.held;
+    record.poll_held = g_poll_mouse.mouse.held; record.mouse_mask = g_observer_mouse_mask;
+    record.prior_ok = prior_ok;
+    if (input_keys) record.input_keys = *input_keys;
+    int n = hogs_observer_format_row(row, sizeof(row), &record);
+    if (n <= 0 || n >= (int)sizeof(row)) { g_observer_disabled = 1; return; }
+    if (!hogs_observer_batch_append(&g_observer_batch, row, (size_t)n)) {
+        observer_flush();
+        if (g_observer_file == INVALID_HANDLE_VALUE ||
+            !hogs_observer_batch_append(&g_observer_batch, row, (size_t)n)) {
+            g_observer_disabled = 1; return;
+        }
+    }
+    g_observer_rows++;
+    DWORD now = GetTickCount();
+    if (g_observer_batch.rows >= HOGS_OBSERVER_BATCH_ROWS || (DWORD)(now - g_observer_last_flush) >= 2000) observer_flush();
+}
+#else
+static void observer_tick(BYTE *user, BYTE prior_ok, const HogsObserverInputKeys *input_keys) { (void)user; (void)prior_ok; (void)input_keys; }
+#endif
 
 static void report_diagnostics(void) {
     DWORD now = now_ms();
@@ -614,6 +719,7 @@ static int merge_mouse(BYTE *buf, BYTE *user) {
     const WORD *bind = (const WORD *)(user + 0x108);
     /* Same contract as HogsFix: returning success when synthetic keys were added. */
     int applied = hm_apply_bindings(buf, bind, mask);
+    if (applied) g_observer_mouse_mask = mask;
     if (applied) DIAG_INC(merge_added);
     else DIAG_INC(merge_invalid_bind);
     return applied;
@@ -638,6 +744,11 @@ static __declspec(naked) BYTE __cdecl call_prior_stub(BYTE *buf, BYTE *user) {
 static BYTE __cdecl chained_kb_state(BYTE *buf, BYTE *user) {
     DIAG_INC(callback);
     BYTE ok = g_prior_kb ? call_prior_stub(buf, user) : 0;
+    HogsObserverInputKeys observer_keys;
+    memset(&observer_keys, 0, sizeof(observer_keys));
+    if (g_installed && g_armed && g_focused && GetCurrentThreadId() == g_game_thread &&
+        is_game_foreground() && !game_ui_active())
+        hogs_observer_capture_keys((uintptr_t)buf, (uintptr_t)user, ok, &observer_keys);
     if (!ok) DIAG_INC(callback_ok0);
     if (!g_installed) return ok;
     if (GetCurrentThreadId() != g_game_thread) { DIAG_INC(callback_thread); return ok; } /* all state stays on the HWND thread */
@@ -655,7 +766,9 @@ static BYTE __cdecl chained_kb_state(BYTE *buf, BYTE *user) {
     g_last_game_input_ms = now;
     if (!ok && buf) memset(buf, 0, 256);
     if (buf && user && g_installed && g_armed && g_focused && is_game_foreground()) sample_poll_mouse(now);
+    g_observer_mouse_mask = 0;
     int added = (buf && user) ? merge_mouse(buf, user) : 0;
+    observer_tick(user, ok, &observer_keys);
     return added ? 1 : ok;
 }
 

@@ -32,9 +32,10 @@ The ASI targets 32-bit Windows, including the validated 32-bit Steam executable 
 zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -Isrc/mouse -Wl,--strip-all -shared -o HogsMouse.asi src/mouse/HogsMouse.c -luser32 -lkernel32
 zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -DHOGSMOUSE_TEST -Isrc/mouse -o controlled_aim_harness.exe src/mouse/HogsMouse.c tests/mouse/controlled_aim_harness.c -luser32 -lkernel32
 cc -std=c11 -O2 -Isrc/mouse tests/mouse/controlled_aim_policy_test.c -o controlled_aim_policy_test
+zig cc -target x86-windows-gnu -std=c11 -O2 -Isrc/mouse -o observer_read_harness.exe tests/mouse/observer_read_harness.c -lkernel32
 ```
 
-The candidate is not installed by the 0.5 release. On macOS it also requires the native focus publisher and matching launcher wiring described in `src/native/README.md`; copying only the ASI is insufficient for the complete Mac focus protection.
+The candidate is not installed by the 0.5 release. The source currently adds a bounded game-state observer to the controlled-RMB mapping; this does not implement the requested chase camera. See [observer.md](docs/observer.md). On macOS it also requires the native focus publisher and matching launcher wiring described in `src/native/README.md`; copying only the ASI is insufficient for the complete Mac focus protection.
 
 ## Texture Toolkit adaptation
 

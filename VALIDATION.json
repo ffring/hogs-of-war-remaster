@@ -27,8 +27,8 @@
       "actual_game_test": "passed: active app transitions enabled and disabled game-scoped input"
     },
     "native_policy_cases": 11,
-    "candidate_asi_sha256": "bc49730f91ff3ff650c0bfd8c4a70a531cdb61132241204a32996015a5b0bdb8",
-    "candidate_variant": "controlled RMB aim",
+    "candidate_asi_sha256": "11d244c0430920917e053d98017ae6563c7f9c897c0b80b216867e83f74b4e69",
+    "candidate_variant": "controlled RMB aim plus bounded read-only observer",
     "controlled_aim_deterministic_result": "13 CUI groups plus release ASI load passed; movement consumed per read; held RMB modifier; no historical whole-step backlog",
     "in_game_input_device": "Owner tested on MacBook trackpad; requested ordinary mouse semantics and confirmed a physical mouse is also available.",
     "owner_acceptance": "failed_camera_and_fire_behavior",
@@ -39,6 +39,15 @@
       "camera_method_cpu_emulation_cases": 34,
       "camera_method_cpu_emulation_result": "passed synthetic direct method calls only",
       "actual_game_chase_camera_tested": false
+    },
+    "controlled_aim_base_asi_sha256": "bc49730f91ff3ff650c0bfd8c4a70a531cdb61132241204a32996015a5b0bdb8",
+    "observer": {
+      "synthetic_memory_and_csv_fixture": "passed",
+      "release_asi_load": "passed",
+      "local_install_and_readback": "passed",
+      "actual_game_trace": "pending",
+      "camera_control_changes": false,
+      "game_launched_for_validation": false
     }
   },
   "network": {
