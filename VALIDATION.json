@@ -111,11 +111,12 @@
     "structural_test_groups": 4,
     "synthetic_and_real_Win32_memory_groups": 10,
     "release_load": "passed",
-    "installed_on_owner_mac": false,
+    "installed_on_owner_mac": true,
     "runtime_alias_load_verified": false,
     "visual_fix_verified": false,
     "included_in_0_5_installers": false,
     "asi_sha256": "2e43c0e54d1600a0db505d6a43292e630a5a7817cfdeb1f8227f3b4ac75cbc31",
-    "install_status": "staged; installation deferred while game was open"
+    "install_status": "installed with game closed; readback and core/mouse/HD/launcher checks passed",
+    "game_launched_for_install": false
   }
 }
