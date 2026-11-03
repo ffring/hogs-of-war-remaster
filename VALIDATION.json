@@ -19,7 +19,7 @@
     "native_publisher_and_launcher_fixture": "passed",
     "physical_mouse_in_game_tested": true,
     "included_in_0_5_installers": false,
-    "physical_mouse_result": "Native foreground and input injection confirmed. Previous free-aim version had erratic camera and reticle flicker. Controlled-aim revision physical test pending.",
+    "physical_mouse_result": "Owner verified input and foreground changes. Controlled-RMB revision improved behavior but still has camera direction/orbit/distance and firing issues. Not accepted as finished third-person mouse controls.",
     "focus_publisher_runloop_fix": {
       "publisher_sha256": "bd7f4a145086baeaada00b971b86386916c04f4a94f480c441ac63e0c04f1fe2",
       "actual_production_wait_delivers_cf_timers": true,
@@ -29,7 +29,17 @@
     "native_policy_cases": 11,
     "candidate_asi_sha256": "bc49730f91ff3ff650c0bfd8c4a70a531cdb61132241204a32996015a5b0bdb8",
     "candidate_variant": "controlled RMB aim",
-    "controlled_aim_deterministic_result": "13 CUI groups plus release ASI load passed; movement consumed per read; held RMB modifier; no historical whole-step backlog"
+    "controlled_aim_deterministic_result": "13 CUI groups plus release ASI load passed; movement consumed per read; held RMB modifier; no historical whole-step backlog",
+    "in_game_input_device": "Owner tested on MacBook trackpad; requested ordinary mouse semantics and confirmed a physical mouse is also available.",
+    "owner_acceptance": "failed_camera_and_fire_behavior",
+    "chase_camera_implemented": false,
+    "trackpad_toggle_enabled": false,
+    "native_axis_research": {
+      "static_control_queue_to_camera_handler": "traced for exact Steam executable",
+      "camera_method_cpu_emulation_cases": 34,
+      "camera_method_cpu_emulation_result": "passed synthetic direct method calls only",
+      "actual_game_chase_camera_tested": false
+    }
   },
   "network": {
     "directplay_exchange_on_same_mac_loopback": "passed",
