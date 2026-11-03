@@ -1,0 +1,42 @@
+{
+  "status": "staged_not_installed",
+  "asi_sha256": "22b481da04ab9fd3e263f5ceac2ec92701b3ac837400d2cd853728df9b042ae3",
+  "self_contained_public_source_rebuild_same_ASI": true,
+  "no_game_launched": true,
+  "installed_asi_unchanged": true,
+  "input_regression_groups": 19,
+  "axis_CUI_groups": 7,
+  "release_ASI_load": true,
+  "native_UI_CUI": {
+    "menu_bridge": {
+      "rc": 0,
+      "pass_lines": 43,
+      "unsupported": []
+    },
+    "runtime": {
+      "rc": 0,
+      "pass_lines": 25,
+      "unsupported": []
+    },
+    "ini": {
+      "rc": 0,
+      "pass_lines": 1,
+      "unsupported": [
+        "UNSUPPORTED symlink test: API reported creation but the reparse point was not observable"
+      ]
+    }
+  },
+  "native_font_CPU_emulation": {
+    "settings_lines": 13,
+    "settings_glyphs": 114,
+    "options_lines": 7,
+    "options_glyphs": 55,
+    "native_GetText_ret4_and_font_ret12_checked": true,
+    "actual_game_visibility_tested": false
+  },
+  "linear_aim_default_enabled": false,
+  "linear_aim_network_safe_when_enabled": false,
+  "original_body_peak_speed_cap_retained": true,
+  "symlink_validation_on_native_Windows": "outstanding; Wine could not expose its test symlink as a reparse point",
+  "current_russian_font_assets_required": true
+}

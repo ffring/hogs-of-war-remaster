@@ -1,3 +1,5 @@
+> Legacy source: the owner requested settings in the game. See experiments/native-menu for the staged native replacement. This panel is no longer offered.
+
 # Mac mouse settings panel
 
 Native AppKit panel for the owner-installed HogsMouse live-tuning module.

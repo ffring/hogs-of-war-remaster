@@ -48,7 +48,8 @@
       "actual_game_trace": "pending",
       "camera_control_changes": false,
       "game_launched_for_validation": false
-    }
+    },
+    "status": "historical observer revision, superseded by accepted native body and current tuning"
   },
   "network": {
     "directplay_exchange_on_same_mac_loopback": "passed",
@@ -85,7 +86,7 @@
     "release_load": "passed",
     "pure_aim_scaler_groups": 8,
     "pure_native_packet_groups": 7,
-    "physical_game_tested": false,
+    "physical_game_tested": true,
     "nominal_gain": 3,
     "body_axis_cap": 120,
     "digital_aim_max_one_direction_per_read": true,
@@ -93,7 +94,8 @@
     "aim_invert_y": true,
     "INI_live_reload_after_button_release": "passed Windows API console fixture",
     "included_in_0_5_installers": false,
-    "native_game_menu_settings": false
+    "native_game_menu_settings": false,
+    "physical_result": "Owner reports sensitivity increase not perceptible; nominal small-motion gain still saturates old native/digital consumers."
   },
   "mac_mouse_settings": {
     "source": "src/mac-settings",
@@ -101,7 +103,8 @@
     "ad_hoc_signature": "passed",
     "hidden_UI_and_error_layout_review": "passed",
     "production_ini_written_during_validation": false,
-    "game_launched": false
+    "game_launched": false,
+    "status": "legacy source; separate panel rejected in favor of native game settings"
   },
   "scope_mask_candidate": {
     "source": "experiments/scope-mask",
@@ -112,11 +115,27 @@
     "synthetic_and_real_Win32_memory_groups": 10,
     "release_load": "passed",
     "installed_on_owner_mac": true,
-    "runtime_alias_load_verified": false,
+    "runtime_alias_load_verified": true,
     "visual_fix_verified": false,
     "included_in_0_5_installers": false,
     "asi_sha256": "2e43c0e54d1600a0db505d6a43292e630a5a7817cfdeb1f8227f3b4ac75cbc31",
     "install_status": "installed with game closed; readback and core/mouse/HD/launcher checks passed",
     "game_launched_for_install": false
+  },
+  "native_menu_candidate": {
+    "installed_on_owner_mac": false,
+    "source": "experiments/native-menu",
+    "asi_sha256": "22b481da04ab9fd3e263f5ceac2ec92701b3ac837400d2cd853728df9b042ae3",
+    "physical_game_tested": false,
+    "no_game_launched_for_validation": true,
+    "native_options_renderer": "Original FE17/21–23 plus fourth Mouse row drawn through native bitmap font; cached row visibility not assumed",
+    "menu_ini_range": [
+      25,
+      1000
+    ],
+    "conditional_wait_guard": "Existing native wait phase only, release then fresh press",
+    "linear_aim_enabled_by_default": false,
+    "linear_aim_limit": "Mode14/weapon7; local token decoder incompatible with remote peers when enabled",
+    "included_in_0_5_installers": false
   }
 }

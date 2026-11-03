@@ -817,8 +817,9 @@ static int merge_mouse(BYTE *buf, BYTE *user) {
     HMState no_motion={0}; if (!state) state=&no_motion;
     uint16_t mask=hm_button_state_take_fire(&g_button_state);
     if (aiming) {
-        /* Mode 14 does not consume generic camera axes. Retain the verified
-           native aim keys instead of feeding an unproven analog vertical axis. */
+        /* This installed baseline deliberately retains digital aim. Later retail
+           tracing proved mode14 also consumes analog axes with joystick
+           acceleration; see docs/native-control-path.md for the correction. */
         if (state->last_motion_ms && (DWORD)(now-state->last_motion_ms)>100) {
             state->dx=state->dy=0;
             hm_aim_scale_clear(&g_aim_scale);
