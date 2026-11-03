@@ -17,8 +17,15 @@
     "release_load_smoke": "passed",
     "native_to_wine_read_only_focus_mapping_phases": 8,
     "native_publisher_and_launcher_fixture": "passed",
-    "physical_mouse_in_game_tested": false,
-    "included_in_0_5_installers": false
+    "physical_mouse_in_game_tested": true,
+    "included_in_0_5_installers": false,
+    "physical_mouse_result": "Failed with original publisher: valid mailbox stayed inactive while mouse events arrived. Corrected runloop publisher is a new candidate, not yet accepted in game.",
+    "focus_publisher_runloop_fix": {
+      "publisher_sha256": "bd7f4a145086baeaada00b971b86386916c04f4a94f480c441ac63e0c04f1fe2",
+      "actual_production_wait_delivers_cf_timers": true,
+      "synthetic_mailbox_heartbeat_and_parent_exit": "passed",
+      "actual_game_test": "pending"
+    }
   },
   "network": {
     "directplay_exchange_on_same_mac_loopback": "passed",

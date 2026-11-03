@@ -1,6 +1,7 @@
 #import <AppKit/AppKit.h>
 #include "hogs_mac_focus.h"
 #include "focus_mailbox.h"
+#include "focus_runloop_wait.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -98,8 +99,8 @@ static void publish(HMMacFocusRecord *view, uint32_t *sequence,
 
 static void sleep_50ms(void)
 {
-    struct timespec delay = { 0, 50000000 };
-    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    /* The timer in this helper keeps an otherwise empty mode alive. */
+    hogs_focus_runloop_wait_50ms();
 }
 
 int main(int argc, char **argv)
@@ -148,11 +149,22 @@ int main(int argc, char **argv)
     }
 #endif
 
+    uint32_t last_active = UINT32_MAX;
+    pid_t last_frontmost = -2;
     while (getppid() == target && process_is_alive(target)) {
-        pid_t frontmost = hogs_mac_frontmost_pid();
-        publish(view, &sequence, target, token_lo, token_hi,
-                frontmost == target && frontmost > 0);
-        sleep_50ms();
+        @autoreleasepool {
+            pid_t frontmost = hogs_mac_frontmost_pid();
+            uint32_t active = frontmost == target && frontmost > 0;
+            publish(view, &sequence, target, token_lo, token_hi, active);
+            if (active != last_active || frontmost != last_frontmost) {
+                fprintf(stderr, "focus-state active=%u target_pid=%d front_pid=%d\n",
+                        active, (int)target, (int)frontmost);
+                fflush(stderr);
+                last_active = active;
+                last_frontmost = frontmost;
+            }
+            sleep_50ms();
+        }
     }
     publish(view, &sequence, target, token_lo, token_hi, 0);
     munmap(view, sizeof(*view));
