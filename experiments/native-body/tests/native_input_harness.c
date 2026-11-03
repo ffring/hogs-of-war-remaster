@@ -87,6 +87,33 @@ void hm_test_set_native_context(BYTE*,int,int,int);
 void hm_test_apply_native(BYTE*,DWORD*,DWORD*);
 int hm_test_native_ready(void);
 void hm_test_set_native_kind(int);
+void hm_test_set_tuning(int,int,int,int);
+void hm_test_load_config(void);
+void hm_test_refresh_config(void);
+int hm_test_config_gain(void);
+int hm_test_config_aim(void);
+int hm_test_config_invert_y(void);
+int hm_test_config_invert_x(void);
+void hm_test_set_enabled(int);
+int hm_test_is_enabled(void);
+
+/* The harness is copied to a fresh temporary directory by the runner. This
+   writes only the INI adjacent to that console EXE, never the owner's prefix. */
+static int write_test_config(const char *text, unsigned generation) {
+    char path[MAX_PATH]; DWORD n=GetModuleFileNameA(NULL,path,MAX_PATH);
+    if(!n || n>=MAX_PATH) return 0;
+    while(n && path[n-1]!='\\') --n;
+    if(n>=MAX_PATH-14) return 0;
+    lstrcpyA(path+n,"HogsMouse.ini");
+    HANDLE h=CreateFileA(path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(h==INVALID_HANDLE_VALUE) return 0;
+    DWORD count=0; int ok=WriteFile(h,text,(DWORD)strlen(text),&count,NULL) && count==strlen(text);
+    FILETIME ft; ULARGE_INTEGER ticks;
+    GetSystemTimeAsFileTime(&ft); ticks.LowPart=ft.dwLowDateTime;ticks.HighPart=ft.dwHighDateTime;
+    ticks.QuadPart+=(ULONGLONG)generation*20000000;
+    ft.dwLowDateTime=ticks.LowPart;ft.dwHighDateTime=ticks.HighPart;
+    ok=SetFileTime(h,NULL,NULL,&ft)&&ok; CloseHandle(h);return ok;
+}
 
 static void ready(BYTE *b,BYTE *u,int weapon) {
     hm_test_reset_state();hm_test_set_native_context(u,6,weapon,4);read_frame(b,u);
@@ -153,5 +180,51 @@ int main(void) {
  hm_test_set_native_context(u,6,0,4);read_frame(b,u);hm_test_poll_state();read_frame(b,u);
  T(!(b[0x39]&0x80),"turn change carried fire into new turn");
  puts("PASS turn transition clears fire and motion; no carry into next human turn");
+
+ ready(b,u,0);hm_test_set_tuning(12,300,1,1);
+ hm_test_raw_motion(1,0);read_frame(b,u);ax=mask=0;hm_test_apply_native(u,&ax,&mask);
+ T(ax==12,"threefold native body sensitivity or aim inversion leaked into body");
+ hm_test_raw_motion(256,0);read_frame(b,u);ax=mask=0;hm_test_apply_native(u,&ax,&mask);
+ T(ax==120,"native safety cap changed");
+ puts("PASS threefold body gain below saturation; native safety cap retained");
+
+ ready(b,u,7);hm_test_set_tuning(12,300,1,1);
+ hm_test_raw_button_event(RI_MOUSE_RIGHT_BUTTON_DOWN);read_frame(b,u);
+ hm_test_raw_motion(2,2);read_frame(b,u);
+ T((b[0xcb]&0x80)&&(b[0xc8]&0x80)&&!(b[0x20]&0x80)&&!(b[0xd0]&0x80),"both aim axes inversion");
+ hm_test_raw_motion(-2,-2);read_frame(b,u);
+ T((b[0x20]&0x80)&&(b[0xd0]&0x80)&&!(b[0xcb]&0x80)&&!(b[0xc8]&0x80),"aim reversal");
+ read_frame(b,u);T(!(b[0x20]&0x80)&&!(b[0xcb]&0x80)&&!(b[0xc8]&0x80)&&!(b[0xd0]&0x80)&&(b[0x1d]&0x80),"scaled aim has idle debt");
+ puts("PASS both aim axes invert independently from body and remain idle while stationary");
+
+ int pulses[2]={0,0};
+ for(int p=0;p<2;p++) {
+   ready(b,u,7);hm_test_set_tuning(4,p?300:100,0,0);
+   hm_test_raw_button_event(RI_MOUSE_RIGHT_BUTTON_DOWN);read_frame(b,u);
+   for(int f=0;f<4;f++){hm_test_raw_motion(1,0);read_frame(b,u);pulses[p]+=(b[0x20]&0x80)!=0;}
+ }
+ T(pulses[0]==1&&pulses[1]==3,"small-motion aim gain is not threefold");
+ puts("PASS threefold small-motion aim threshold response without queued whole steps");
+
+ ready(b,u,0);hm_test_load_config();
+ T(hm_test_config_gain()==12&&hm_test_config_aim()==300&&hm_test_config_invert_y()==1&&hm_test_config_invert_x()==1,"factory INI not consumed by production loader");
+ puts("PASS actual factory INI loaded by production Windows profile API");
+
+ T(write_test_config("[Mouse]\r\nEnable=1\r\nNativeUnitsPerPixel=8\r\nAimSensitivityPercent=150\r\nInvertY=0\r\nInvertX=0\r\n",1),"write runtime config");
+ hm_test_set_buttons(1);hm_test_set_now(3000);hm_test_refresh_config();
+ T(hm_test_config_gain()==12&&hm_test_config_aim()==300,"reload interrupted physically held fire");
+ hm_test_set_buttons(0);hm_test_raw_button_event(RI_MOUSE_RIGHT_BUTTON_DOWN);
+ hm_test_set_now(4100);hm_test_refresh_config();
+ T(hm_test_config_gain()==12,"reload interrupted event-owned aim");
+ hm_test_raw_button_event(RI_MOUSE_RIGHT_BUTTON_UP);hm_test_set_enabled(0);
+ hm_test_set_now(5200);hm_test_refresh_config();
+ T(hm_test_config_gain()==8&&hm_test_config_aim()==150&&hm_test_config_invert_x()==0&&hm_test_config_invert_y()==0,"live metadata reload failed");
+ T(!hm_test_is_enabled()&&!hm_test_native_ready(),"reload lost runtime disable or retained packet");
+ puts("PASS live config reload waits for physical and event button release; disable state retained");
+
+ T(write_test_config("[Mouse]\r\nNativeUnitsPerPixel=1000\r\nAimSensitivityPercent=5\r\nInvertY=1\r\nInvertX=1\r\n",2),"write clamped config");
+ hm_test_set_now(6300);hm_test_refresh_config();
+ T(hm_test_config_gain()==24&&hm_test_config_aim()==25,"configuration safety bounds");
+ puts("PASS hot-reloaded out-of-range sensitivity is bounded");
  return 0;
 }

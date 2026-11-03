@@ -1,24 +1,42 @@
-# Native body-turn experiment
+# HogsMouse native body input and live tuning
 
-This source is an experiment installed on the owner machine for a manual battle test. It is not included in the 0.5 test installers and has not been accepted in a real game. Installation/readback and launcher/profile checks passed with the game closed; no game was launched by the installer. No runtime logs or game executable are included here.
+The owner accepted character turning with the chase camera in battle on
+2026-11-04. The next revision corrects both weapon-aim axes at the owner's
+request, adds nominal 3x sensitivity and reloadable tuning. These new settings
+have console validation; their physical feel is pending the next owner test.
 
-Mouse X is packed into the original synchronized input record and the game applies native pig turning. The original mode-4 camera follows the pig, as observed in the owner keyboard trace. Holding RMB with a selected weapon retains the already tested digital aim-key path; unarmed RMB does not request the independent orbit camera. LMB remains native fire/charge/release. Free vertical view outside weapon aiming is not implemented. Actual multiplayer mouse behavior is unverified.
+Mouse X uses the original synchronized input packet and native character turn.
+RMB with a weapon uses the verified digital hold-to-aim path; LMB independently
+fires, charges and releases. Unarmed RMB does not open independent orbit.
+Free vertical view while walking remains unsupported. No camera/pig memory
+is written. Actual two-computer multiplayer mouse acceptance is unverified.
 
-The native bridge replaces only the version-checked seven-byte instruction at 0x45DB97 in process memory, preserves the original MOV, registers, flags and stack, then calls back to edit the axis/mask input record. It retains the existing HogsFix keyboard callback chain. Camera and character memory are never written by this module.
+`HogsMouse.ini` defaults: `NativeUnitsPerPixel=12` (range 1..24),
+`AimSensitivityPercent=300` (25..1000), `InvertX=1`, `InvertY=1`.
+Inversion affects weapon aiming only. Body gain was previously 4. The native
+body axis remains capped at +/-120, so 3x applies below saturation. Digital
+aim can emit at most one direction per read; scaling improves the response to
+small movements without promising 3x peak angular velocity or queuing steps.
 
-BODY packets use gain 4 by default (`NativeUnitsPerPixel`, range 1..8). Native turn processing divides X twice, so a one-pixel delta yields one angle unit at the default gain. The packet is bounded and consumed once. Native human input type 0 is checked before applying this policy; unknown/type-2 controllers are rejected. Existing joystick input is retained. Keyboard UP/DOWN are converted only when they must coexist with a mouse turn; the retail branch was executed offline to verify their sign and native walk arguments. Other action bits survive the conversion.
+The settings file is polled at most once per second using metadata. Reloading
+waits until physical and event-owned buttons are released, clears all staged
+motion and disarms until release, and preserves the runtime enable toggle.
+The separate Mac panel edits only sensitivity and inversion. Native frontend
+menu insertion needs further verified reverse engineering and is not claimed.
 
-Thirteen production-input console groups, six bridge ABI/patch groups, the release ASI load check and native policy checks passed using synthetic input/memory. Sixteen additional executions fed real policy-generated packets through a bounded fragment of the verified retail executable, confirming one-pixel turns and simultaneous UP/DOWN walking for the human and synchronized-queue types. No game was launched for these checks. This does not establish physical mouse feel, weapon interaction quality or full multiplayer acceptance.
+The executable/input bridge, foreground publisher and HogsFix keyboard chain
+remain version guarded. All 140 original model/texture archives remain intact,
+with the existing 24-page GPU HD replacement profile.
 
-## Build
+## Build and validation
 
-Use Zig 0.14.1 from the repository root:
+Use Zig 0.14.1, `-target x86-windows-gnu -fms-extensions -std=c11 -O2`,
+`-Ihelpers`, `-shared`, `-luser32 -lkernel32` for `HogsMouse.c`. For the console
+harness add `-DHOGSMOUSE_TEST`, omit `-shared`, add
+`tests/native_input_harness.c`. Pure policy/scaler tests use ordinary C11.
 
-```sh
-zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -Iexperiments/native-body/helpers -Wl,--strip-all -shared -o HogsMouse-native-body.asi experiments/native-body/HogsMouse.c -luser32 -lkernel32
-zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -DHOGSMOUSE_TEST -Iexperiments/native-body/helpers -o native_input_harness.exe experiments/native-body/HogsMouse.c experiments/native-body/tests/native_input_harness.c -luser32 -lkernel32
-zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -Iexperiments/native-body/helpers -o native_axis_bridge_harness.exe experiments/native-body/tests/native_axis_bridge_harness.c -lkernel32
-cc -std=c11 -O2 -Iexperiments/native-body/helpers experiments/native-body/tests/native_input_policy_test.c -o native_input_policy_test
-```
-
-Run Windows console fixtures only in a separate test prefix, without a game process. Mac runtime input also needs the native foreground publisher and matching launcher wiring in `src/native`. Installing only an ASI does not supply that integration. Close the game before replacing modules. Keep the complete current profile and rollback files together.
+Run Windows fixtures sequentially only in a separate test prefix. The runtime
+record covers six bridge groups, nineteen production-input groups and a
+release-ASI import/DllMain load probe. Pure tests cover fractional sensitivity,
+reversal, bounds, reset, independent fire and native packet ownership. The
+fixtures use synthetic memory and inputs; they do not launch the game.

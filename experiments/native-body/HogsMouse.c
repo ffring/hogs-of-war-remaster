@@ -13,6 +13,7 @@
 #include "button_state.h"
 #include "observer_read.h"
 #include "native_input_policy.h"
+#include "aim_scale.h"
 #include "native_axis_bridge.h"
 #include "observer_buffer.h"
 
@@ -33,14 +34,20 @@ static HWND g_hwnd;
 static DWORD g_game_thread;
 static int g_installed, g_raw_registered, g_enabled = 1, g_cfg_loaded, g_armed, g_f6_down, g_focused;
 static int g_initializing, g_permanent_failure;
-static int g_sensitivity = 4, g_invert_y, g_require_rmb = 1;
+static int g_sensitivity = 4, g_invert_y = 1, g_require_rmb = 1;
 static HMState g_mouse;
 static HMState g_legacy_mouse;
 static HMPollState g_poll_mouse;
 static HMButtonState g_button_state;
 static int g_aim_source;
 static HNPacket g_native_packet;
-static int g_native_gain = 4;
+static int g_native_gain = 12;
+static int g_invert_x = 1;
+static HMAimScale g_aim_scale = {0,0,300};
+static char g_ini_path[MAX_PATH];
+static DWORD g_cfg_poll_at;
+static WIN32_FILE_ATTRIBUTE_DATA g_cfg_file;
+static int g_cfg_file_known;
 static DWORD g_native_human;
 static DWORD g_context_user, g_context_camera, g_context_weapon, g_context_mode;
 static int g_context_route;
@@ -92,6 +99,8 @@ static void record_button_event(uint8_t button, int down);
 static void __cdecl native_packet_callback(BYTE *user, DWORD *axes, DWORD *mask);
 static int native_gate_allowed(void);
 static void native_refresh_context(BYTE *user);
+static void load_config(void);
+static void refresh_config(void);
 #ifdef HOGSMOUSE_TEST
 static DWORD g_test_now;
 static uint8_t g_test_buttons;
@@ -374,6 +383,7 @@ static BOOL register_mouse(HWND hwnd) {
 }
 
 static void reset_aim_motion(void) {
+    hm_aim_scale_clear(&g_aim_scale);
     hn_clear(&g_native_packet);
     hm_clear(&g_mouse);
     hm_clear(&g_legacy_mouse);
@@ -796,6 +806,7 @@ static int merge_mouse(BYTE *buf, BYTE *user) {
     int source=hm_poll_choose_source(g_raw_registered && g_raw_registration_matches,
         g_raw_seen,g_raw_event_ms,g_legacy_active,g_legacy_event_ms,g_poll_mouse.sample_valid,now);
     if (source!=g_aim_source) {
+        hm_aim_scale_clear(&g_aim_scale);
         g_mouse.remainder_dx=g_mouse.remainder_dy=0;
         g_legacy_mouse.remainder_dx=g_legacy_mouse.remainder_dy=0;
         g_poll_mouse.mouse.remainder_dx=g_poll_mouse.mouse.remainder_dy=0;
@@ -808,6 +819,14 @@ static int merge_mouse(BYTE *buf, BYTE *user) {
     if (aiming) {
         /* Mode 14 does not consume generic camera axes. Retain the verified
            native aim keys instead of feeding an unproven analog vertical axis. */
+        if (state->last_motion_ms && (DWORD)(now-state->last_motion_ms)>100) {
+            state->dx=state->dy=0;
+            hm_aim_scale_clear(&g_aim_scale);
+        }
+        int32_t sx=0,sy=0;
+        hm_aim_scale_frame(&g_aim_scale,state->dx,state->dy,&sx,&sy);
+        state->dx=g_invert_x ? -sx : sx;
+        state->dy=sy;
         uint16_t aim=hm_read_aim(state,now,g_sensitivity,g_invert_y,1,1);
         mask|=aim;
         if (aim & HM_UP) DIAG_INC(aim_up); if (aim & HM_DOWN) DIAG_INC(aim_down);
@@ -942,17 +961,46 @@ static void load_config(void) {
     g_sensitivity = GetPrivateProfileIntA("Mouse", "PixelsPerStep", 4, ini);
     if (g_sensitivity < 1) g_sensitivity = 1;
     if (g_sensitivity > 64) g_sensitivity = 64;
-    g_invert_y = GetPrivateProfileIntA("Mouse", "InvertY", 0, ini) != 0;
-    g_native_gain = GetPrivateProfileIntA("Mouse", "NativeUnitsPerPixel", 4, ini);
+    g_invert_y = GetPrivateProfileIntA("Mouse", "InvertY", 1, ini) != 0;
+    g_native_gain = GetPrivateProfileIntA("Mouse", "NativeUnitsPerPixel", 12, ini);
     if (g_native_gain < 1) g_native_gain = 1;
-    if (g_native_gain > 8) g_native_gain = 8;
+    if (g_native_gain > 24) g_native_gain = 24;
+    g_invert_x = GetPrivateProfileIntA("Mouse", "InvertX", 1, ini) != 0;
+    int aim_percent = GetPrivateProfileIntA("Mouse", "AimSensitivityPercent", 300, ini);
+    if (aim_percent < 25) aim_percent = 25;
+    if (aim_percent > 1000) aim_percent = 1000;
+    hm_aim_scale_init(&g_aim_scale,aim_percent);
     int configured_rmb = GetPrivateProfileIntA("Mouse", "RequireRightButton", 1, ini) != 0;
     g_require_rmb = hm_normalize_require_rmb(configured_rmb);
     if (!configured_rmb)
         log_line("RequireRightButton=0 is an old free-aim setting and is ignored; hold the right mouse button to aim.");
     if (GetPrivateProfileIntA("Mouse", "CaptureCursor", 0, ini))
         log_line("CaptureCursor is reserved and unsupported; cursor remains free.");
+    lstrcpynA(g_ini_path,ini,MAX_PATH);
+    g_cfg_file_known=GetFileAttributesExA(ini,GetFileExInfoStandard,&g_cfg_file) &&
+        !(g_cfg_file.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
     g_cfg_loaded = 1;
+}
+
+/* Check metadata once a second. Apply only after mouse buttons are released,
+   so changing settings cannot split a charged shot or an aim gesture. */
+static void refresh_config(void) {
+    DWORD now=now_ms();
+    if (!g_cfg_loaded || !g_ini_path[0] ||
+        (g_cfg_poll_at && (DWORD)(now-g_cfg_poll_at)<1000)) return;
+    g_cfg_poll_at=now;
+    WIN32_FILE_ATTRIBUTE_DATA next;
+    if (!GetFileAttributesExA(g_ini_path,GetFileExInfoStandard,&next) ||
+        (next.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return;
+    if (g_cfg_file_known && next.ftLastWriteTime.dwLowDateTime==g_cfg_file.ftLastWriteTime.dwLowDateTime &&
+        next.ftLastWriteTime.dwHighDateTime==g_cfg_file.ftLastWriteTime.dwHighDateTime &&
+        next.nFileSizeHigh==g_cfg_file.nFileSizeHigh && next.nFileSizeLow==g_cfg_file.nFileSizeLow) return;
+    if (g_button_state.held || g_button_state.pressed || physical_buttons_down_mask()) return;
+    int was_enabled=g_enabled;
+    clear_and_disarm(NULL);
+    load_config();
+    g_enabled=was_enabled; /* Runtime F6 state remains under the player's control. */
+    log_line("Mouse tuning reloaded after button release.");
 }
 
 #ifdef HOGSMOUSE_TEST
@@ -962,6 +1010,15 @@ void hm_test_set_native_context(BYTE *u,int battle,int weapon,int mode) {
     g_test_active_user=u;g_test_battle=battle;g_test_weapon=weapon;g_test_cam_mode=mode;
 }
 void hm_test_set_native_kind(int kind) { g_test_kind=kind; }
+void hm_test_set_tuning(int gain,int percent,int invert_x,int invert_y) {
+    g_native_gain=gain;hm_aim_scale_init(&g_aim_scale,percent);g_invert_x=invert_x;g_invert_y=invert_y;
+}
+void hm_test_load_config(void) { load_config(); }
+void hm_test_refresh_config(void) { refresh_config(); }
+int hm_test_config_gain(void) { return g_native_gain; }
+int hm_test_config_aim(void) { return g_aim_scale.percent; }
+int hm_test_config_invert_y(void) { return g_invert_y; }
+int hm_test_config_invert_x(void) { return g_invert_x; }
 void hm_test_apply_native(BYTE *u,DWORD *axes,DWORD *mask) { native_packet_callback(u,axes,mask); }
 int hm_test_native_ready(void) { return g_native_packet.ready; }
 __declspec(naked) void hm_test_call_stub(void) { __asm { jmp mouse_kb_stub } }
@@ -969,6 +1026,8 @@ void hm_test_reset_state(void) {
     memset(&g_mouse, 0, sizeof(g_mouse)); memset(&g_legacy_mouse, 0, sizeof(g_legacy_mouse));
     hm_button_state_clear(&g_button_state);
     hn_clear(&g_native_packet); g_native_gain=4;g_native_human=0;
+    hm_aim_scale_init(&g_aim_scale,100);g_invert_x=0;
+    g_cfg_loaded=0;g_ini_path[0]=0;g_cfg_file_known=0;g_cfg_poll_at=0;
     g_context_user=g_context_camera=g_context_weapon=g_context_mode=0;g_context_route=HN_NONE;
     g_test_active_user=NULL;g_test_battle=6;g_test_weapon=0;g_test_cam_mode=4;g_test_context_valid=1;g_test_kind=0;
     hm_poll_reset(&g_poll_mouse);
@@ -985,6 +1044,7 @@ void hm_test_reset_state(void) {
 }
 void hm_test_set_now(DWORD now) { g_test_now = now; }
 void hm_test_set_buttons(BYTE buttons) { g_test_buttons = buttons; }
+void hm_test_set_enabled(int enabled) { g_enabled=enabled; }
 void hm_test_set_raw_registration_match(int matches) { g_test_raw_registration_match = matches != 0; }
 void hm_test_set_require_rmb(int enabled) { g_require_rmb = hm_normalize_require_rmb(enabled); }
 void hm_test_set_cursor(LONG x, LONG y, int valid) { g_test_cursor_x=x; g_test_cursor_y=y; g_test_cursor_valid=valid; }
@@ -1106,6 +1166,7 @@ done:
 
 static void poll_control_state(void) {
     if (!g_game_thread || GetCurrentThreadId() != g_game_thread) return;
+    refresh_config();
     poll_focus_state();
     refresh_raw_registration();
     if (g_installed && g_hwnd && game_ui_active()) {

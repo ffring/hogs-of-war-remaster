@@ -8,7 +8,7 @@ enum { HN_NONE = 0, HN_BODY = 1, HN_AIM = 2 };
    original human input record synchronizes them before simulation consumes it. */
 static inline int hn_axis(int64_t pixels, int gain) {
     if (gain < 1) gain = 1;
-    if (gain > 8) gain = 8;
+    if (gain > 24) gain = 24;
     int64_t value = (int64_t)pixels * gain;
     return value < -120 ? -120 : value > 120 ? 120 : (int)value;
 }

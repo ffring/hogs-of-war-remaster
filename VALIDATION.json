@@ -59,7 +59,7 @@
   "game_executable_or_full_archives_bundled": false,
   "native_body_experiment": {
     "installed": true,
-    "physical_game_tested": false,
+    "physical_game_tested": true,
     "asi_sha256": "97e58e9029db4f3d427e39b7529f13d358c31eb876d400b737bac117b2bafcf7",
     "production_input_fixture_groups": 13,
     "bridge_fixture_groups": 6,
@@ -74,6 +74,48 @@
     "protected_core_files": 10,
     "original_archives": 140,
     "HD_pages": 24,
-    "owner_game_test": "pending"
+    "owner_game_test": "accepted body turn and chase camera; owner requested aim inversion, 3x sensitivity and wider scope mask"
+  },
+  "mouse_live_tuning": {
+    "installed_on_owner_mac": true,
+    "source": "experiments/native-body",
+    "asi_sha256": "33d1fe4f51f818d966e16ebbaf47e8fed26c54a9147293b93fabf38ce4a255a7",
+    "production_input_fixture_groups": 19,
+    "bridge_fixture_groups": 6,
+    "release_load": "passed",
+    "pure_aim_scaler_groups": 8,
+    "pure_native_packet_groups": 7,
+    "physical_game_tested": false,
+    "nominal_gain": 3,
+    "body_axis_cap": 120,
+    "digital_aim_max_one_direction_per_read": true,
+    "aim_invert_x": true,
+    "aim_invert_y": true,
+    "INI_live_reload_after_button_release": "passed Windows API console fixture",
+    "included_in_0_5_installers": false,
+    "native_game_menu_settings": false
+  },
+  "mac_mouse_settings": {
+    "source": "src/mac-settings",
+    "temporary_file_self_tests": 9,
+    "ad_hoc_signature": "passed",
+    "hidden_UI_and_error_layout_review": "passed",
+    "production_ini_written_during_validation": false,
+    "game_launched": false
+  },
+  "scope_mask_candidate": {
+    "source": "experiments/scope-mask",
+    "original_archives_overwritten": 0,
+    "changed_outer_vertices": 4,
+    "aperture_vertices_unchanged": 42,
+    "structural_test_groups": 4,
+    "synthetic_and_real_Win32_memory_groups": 10,
+    "release_load": "passed",
+    "installed_on_owner_mac": false,
+    "runtime_alias_load_verified": false,
+    "visual_fix_verified": false,
+    "included_in_0_5_installers": false,
+    "asi_sha256": "2e43c0e54d1600a0db505d6a43292e630a5a7817cfdeb1f8227f3b4ac75cbc31",
+    "install_status": "staged; installation deferred while game was open"
   }
 }
