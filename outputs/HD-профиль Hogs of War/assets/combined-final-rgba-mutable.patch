@@ -1,0 +1,2072 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -106,7 +106,7 @@
+     ImTextureID=ImU64
+ )
+ 
+-target_link_libraries(TextureToolkit PRIVATE Shlwapi d3d9 d3d11 dxgi Psapi Version)
++target_link_libraries(TextureToolkit PRIVATE Shlwapi d3d9 d3d11 dxgi Psapi Version dwmapi d3dcompiler_47)
+ 
+ # Headless preview of the overlay panel: renders the real draw_ui() against the real TextureManager
+ # on an offscreen D3D11 device and writes a PNG. A development tool for working on the UI without
+
+--- a/src/Config.cpp
++++ b/src/Config.cpp
+@@ -132,6 +132,7 @@
+         // Toggles
+         m_config.enable_injection = GetPrivateProfileIntW(L"TextureToolkit", L"EnableInjection", 1, ini_w) != 0;
+         m_config.auto_dump = GetPrivateProfileIntW(L"TextureToolkit", L"AutoDump", 0, ini_w) != 0;
++        m_config.final_rgba_readback = GetPrivateProfileIntW(L"TextureToolkit", L"FinalRGBAReadback", 0, ini_w) != 0;
+         m_config.filter_small_textures = GetPrivateProfileIntW(L"TextureToolkit", L"FilterSmallTextures", 1, ini_w) != 0;
+         m_config.show_current_frame_only = GetPrivateProfileIntW(L"TextureToolkit", L"ShowCurrentFrameOnly", 1, ini_w) != 0;
+         m_config.accept_sk_names = GetPrivateProfileIntW(L"TextureToolkit", L"AcceptSpecialKNames", 1, ini_w) != 0;
+@@ -184,6 +185,7 @@
+                            " ResourceRoot=" + path_utf8(m_config.resource_root) +
+                            " EnableInjection=" + (m_config.enable_injection ? "1" : "0") +
+                            " AutoDump=" + (m_config.auto_dump ? "1" : "0") +
++                           " FinalRGBAReadback=" + (m_config.final_rgba_readback ? "1" : "0") +
+                            " FilterSmallTextures=" + (m_config.filter_small_textures ? "1" : "0") +
+                            " ShowCurrentFrameOnly=" + (m_config.show_current_frame_only ? "1" : "0") +
+                            " AcceptSpecialKNames=" + (m_config.accept_sk_names ? "1" : "0") +
+@@ -209,6 +211,7 @@
+         Logger::get().info("[ConfigManager] Configuration saved to " + path_utf8(m_ini_path));
+         Logger::get().info(std::string("[ConfigManager] Now: EnableInjection=") + (m_config.enable_injection ? "1" : "0") +
+                            " AutoDump=" + (m_config.auto_dump ? "1" : "0") +
++                           " FinalRGBAReadback=" + (m_config.final_rgba_readback ? "1" : "0") +
+                            " FilterSmallTextures=" + (m_config.filter_small_textures ? "1" : "0") +
+                            " ShowCurrentFrameOnly=" + (m_config.show_current_frame_only ? "1" : "0") +
+                            " AcceptSpecialKNames=" + (m_config.accept_sk_names ? "1" : "0") +
+@@ -233,6 +236,7 @@
+ 
+         put(L"TextureToolkit", L"EnableInjection", flag(m_config.enable_injection));
+         put(L"TextureToolkit", L"AutoDump", flag(m_config.auto_dump));
++        put(L"TextureToolkit", L"FinalRGBAReadback", flag(m_config.final_rgba_readback));
+         put(L"TextureToolkit", L"FilterSmallTextures", flag(m_config.filter_small_textures));
+         put(L"TextureToolkit", L"ShowCurrentFrameOnly", flag(m_config.show_current_frame_only));
+         put(L"TextureToolkit", L"AcceptSpecialKNames", flag(m_config.accept_sk_names));
+@@ -270,6 +274,8 @@
+            << L"; Feature Toggles\r\n"
+            << L"EnableInjection=" << (m_config.enable_injection ? 1 : 0) << L"\r\n"
+            << L"AutoDump=" << (m_config.auto_dump ? 1 : 0) << L"\r\n"
++           << L"; Experimental dgVoodoo final RGBA page readback (normally 0; bounded one-shot capture)\r\n"
++           << L"FinalRGBAReadback=" << (m_config.final_rgba_readback ? 1 : 0) << L"\r\n"
+            << L"FilterSmallTextures=" << (m_config.filter_small_textures ? 1 : 0) << L"\r\n"
+            << L"ShowCurrentFrameOnly=" << (m_config.show_current_frame_only ? 1 : 0) << L"\r\n\r\n"
+            << L"; Also load texture packs named the way Special K names them (CRC-32C of the top mip)\r\n"
+
+--- a/src/Config.h
++++ b/src/Config.h
+@@ -45,6 +45,8 @@
+ 
+         bool enable_injection = true;
+         bool auto_dump = false;
++        // Experimental one-shot dgVoodoo final-RGBA page readback; default off.
++        bool final_rgba_readback = false;
+         bool filter_small_textures = true;
+         bool show_current_frame_only = true;
+ 
+
+--- a/src/D3D11Hook.cpp
++++ b/src/D3D11Hook.cpp
+@@ -13,6 +13,8 @@
+ #include "ScopedFlag.h"
+ #include "Logo.h"
+ #include <atomic>
++#include <array>
++#include <algorithm>
+ #include <imgui.h>
+ #include "imgui_impl_win32.h"
+ #include "imgui_impl_dx11.h"
+@@ -21,11 +23,30 @@
+ #include <mutex>
+ #include <unordered_map>
+ #include <cstdio>
++#include <cstdlib>
++#include <new>
+ 
+ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+ 
+ namespace TextureToolkit
+ {
++    // Temporary bounded diagnostic for the isolated mutable-page startup hang. Set
++    // TT_DIRTY_GUARD_DIAG=1 in the probe environment; OutputDebugString avoids the
++    // Toolkit logger's mutex so it can still identify a blocked hook/logger boundary.
++    static void dirty_guard_diag(const char *event, const void *object = nullptr)
++    {
++        static const bool enabled = [] {
++            const char *value = std::getenv("TT_DIRTY_GUARD_DIAG");
++            return value != nullptr && value[0] == '1' && value[1] == '\0';
++        }();
++        static std::atomic<unsigned> emitted{0};
++        if (!enabled || emitted.fetch_add(1, std::memory_order_relaxed) >= 128)
++            return;
++        char line[192] = {};
++        std::snprintf(line, sizeof(line), "[TT-DIRTY-DIAG] %s object=%p\n", event, object);
++        OutputDebugStringA(line);
++    }
++
+     static WNDPROC g_orig_wndproc = nullptr;
+ 
+     static LRESULT CALLBACK Hooked_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+@@ -217,6 +238,7 @@
+         Entry entries[kMax] = {};
+         std::atomic<int> count{0};
+         std::mutex add_mutex;
++        static thread_local Fn s_active_original;
+ 
+         // Hooks `target` with `detour` the first time it is seen; true if that happened now. The
+         // entry is published before the hook is armed, so a call landing the instant the patch
+@@ -241,6 +263,30 @@
+             return true;
+         }
+ 
++        // Each implementation gets its own forwarding thunk. Wine/DXVK can expose one
++        // vtable implementation that forwards to a second implementation's slot. A
++        // shared detour that re-looks up the object's current slot then selects the
++        // second trampoline even while forwarding the first one, creating recursion.
++        bool add_indexed(void *target, const std::array<void *, kMax> &detours)
++        {
++            std::lock_guard<std::mutex> lock(add_mutex);
++            const int n = count.load(std::memory_order_relaxed);
++            for (int i = 0; i < n; ++i)
++                if (entries[i].target == target)
++                    return false;
++            if (n >= kMax || detours[n] == nullptr)
++                return false;
++
++            Fn original = nullptr;
++            if (!HookManager::get().prepare_hook(target, detours[n], &original))
++                return false;
++            entries[n].target = target;
++            entries[n].original = original;
++            count.store(n + 1, std::memory_order_release);
++            HookManager::get().enable_hook(target);
++            return true;
++        }
++
+         Fn find(void *target) const
+         {
+             const int n = count.load(std::memory_order_acquire);
+@@ -250,8 +296,25 @@
+             return nullptr;
+         }
+ 
++        Fn find_index(int index) const
++        {
++            const int n = count.load(std::memory_order_acquire);
++            return index >= 0 && index < n ? entries[index].original : nullptr;
++        }
++
++        Fn current_original() const { return s_active_original; }
++        Fn exchange_original(Fn original)
++        {
++            Fn previous = s_active_original;
++            s_active_original = original;
++            return previous;
++        }
++
+         bool empty() const { return count.load(std::memory_order_acquire) == 0; }
+     };
++
++    template <typename Fn>
++    thread_local Fn SlotHooks<Fn>::s_active_original = nullptr;
+ 
+     // Device-context functions. An immediate context and a deferred one are different
+     // implementations, so a game that records its draws on deferred contexts (on worker threads)
+@@ -281,6 +344,550 @@
+     constexpr int kSlotCopySubresourceRegion1 = 115;
+     constexpr int kSlotUpdateSubresource1 = 116;
+ 
++    // Temporary, opt-in diagnosis for wrapper conversion paths. It logs first-seen
++    // pixel-stage SRVs and the currently bound RTV size, without changing state.
++    static bool texture_bind_diag_enabled()
++    {
++        const char *value = std::getenv("TT_D3D_BIND_DIAG");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }
++
++    static void log_texture_bind_diagnostic(ID3D11DeviceContext *context, UINT start_slot, UINT count,
++                                           ID3D11ShaderResourceView *const *views)
++    {
++        if (!texture_bind_diag_enabled() || context == nullptr || views == nullptr)
++            return;
++
++        static std::atomic<unsigned> logged{0};
++        static std::mutex seen_mutex;
++        static std::unordered_map<std::string, bool> seen;
++        for (UINT i = 0; i < count && logged.load(std::memory_order_relaxed) < 256; ++i)
++        {
++            ID3D11ShaderResourceView *srv = views[i];
++            if (srv == nullptr)
++                continue;
++
++            D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
++            srv->GetDesc(&srv_desc);
++            const UINT format = static_cast<UINT>(srv_desc.Format);
++
++            ID3D11Resource *resource = nullptr;
++            srv->GetResource(&resource);
++            if (resource == nullptr)
++                continue;
++            ID3D11Texture2D *texture = nullptr;
++            D3D11_TEXTURE2D_DESC tex_desc = {};
++            if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&texture))) && texture != nullptr)
++                texture->GetDesc(&tex_desc);
++            if (texture == nullptr)
++            {
++                resource->Release();
++                continue;
++            }
++
++            char key_buffer[128] = {};
++            std::snprintf(key_buffer, sizeof(key_buffer), "%p:%u:%u:%u", resource, format,
++                          static_cast<unsigned>(srv_desc.ViewDimension), start_slot + i);
++            {
++                std::lock_guard<std::mutex> lock(seen_mutex);
++                if (seen.find(key_buffer) != seen.end())
++                {
++                    texture->Release();
++                    resource->Release();
++                    continue;
++                }
++                seen.emplace(key_buffer, true);
++            }
++
++            ID3D11PixelShader *pixel_shader = nullptr;
++            context->PSGetShader(&pixel_shader, nullptr, nullptr);
++            const void *shader_ptr = pixel_shader;
++
++            ID3D11RenderTargetView *rtv = nullptr;
++            ID3D11DepthStencilView *dsv = nullptr;
++            context->OMGetRenderTargets(1, &rtv, &dsv);
++            UINT rtv_width = 0, rtv_height = 0, rtv_format = 0;
++            const void *rtv_resource_ptr = nullptr;
++            if (rtv != nullptr)
++            {
++                D3D11_RENDER_TARGET_VIEW_DESC view_desc = {};
++                rtv->GetDesc(&view_desc);
++                rtv_format = static_cast<UINT>(view_desc.Format);
++                ID3D11Resource *rtv_resource = nullptr;
++                rtv->GetResource(&rtv_resource);
++                rtv_resource_ptr = rtv_resource;
++                ID3D11Texture2D *rt = nullptr;
++                if (rtv_resource != nullptr && SUCCEEDED(rtv_resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&rt))) && rt != nullptr)
++                {
++                    D3D11_TEXTURE2D_DESC rt_desc = {};
++                    rt->GetDesc(&rt_desc);
++                    rtv_width = rt_desc.Width;
++                    rtv_height = rt_desc.Height;
++                    rt->Release();
++                }
++                if (rtv_resource != nullptr) rtv_resource->Release();
++                rtv->Release();
++            }
++            if (dsv != nullptr) dsv->Release();
++
++            const unsigned n = logged.fetch_add(1, std::memory_order_relaxed);
++            if (n < 256)
++            {
++                Logger::get().info("[D3D11BindDiag] stage=PS slot=" + std::to_string(start_slot + i) +
++                    " srv=" + ptr_hex(srv) + " resource=" + ptr_hex(resource) +
++                    " srv_dim=" + std::to_string(static_cast<unsigned>(srv_desc.ViewDimension)) +
++                    " srv_fmt=" + std::to_string(format) +
++                    " tex=" + std::to_string(tex_desc.Width) + "x" + std::to_string(tex_desc.Height) +
++                    " tex_array=" + std::to_string(tex_desc.ArraySize) +
++                    " ps=" + ptr_hex(shader_ptr) +
++                    " rtv=" + ptr_hex(rtv_resource_ptr) + " rtv_fmt=" + std::to_string(rtv_format) +
++                    " rtv_size=" + std::to_string(rtv_width) + "x" + std::to_string(rtv_height));
++            }
++
++            if (pixel_shader != nullptr) pixel_shader->Release();
++            if (texture != nullptr) texture->Release();
++            resource->Release();
++        }
++    }
++
++    // One-shot readback of the final, normalized RGBA8 array page. This is an opt-in
++    // proof path only: it hashes the same tight rows as normal uploads, then registers
++    // the original GPU resource so the regular DDS replacement can bind on this call.
++    struct FinalRgbaCaptureState
++    {
++        UINT8 attempts = 0;
++        UINT8 in_progress = 0;
++        UINT8 complete = 0;
++        UINT8 dirty = 0; // written after capture: fail closed for this resource until process exit
++    };
++    static const GUID s_final_rgba_capture_marker = {0x53b198d1, 0xa983, 0x44ac, {0x91, 0x3c, 0xd1, 0x4a, 0x2e, 0x75, 0x68, 0x02}};
++    static const GUID s_final_rgba_context_state_guid = {0x2d231fb3, 0x49e8, 0x47a9, {0xb1, 0x5e, 0xd9, 0xa0, 0x4d, 0x2c, 0x81, 0x73}};
++    static std::mutex s_final_rgba_capture_mutex;
++    static unsigned s_final_rgba_capture_count = 0;
++    static size_t s_final_rgba_capture_bytes = 0;
++    static std::atomic<bool> s_final_rgba_tracking_unavailable{false};
++    static bool mark_final_rgba_dirty(ID3D11Resource *resource, const char *reason);
++    static bool is_final_rgba_dirty(ID3D11Resource *resource);
++
++    struct TrackedPsOverride
++    {
++        ID3D11ShaderResourceView *original = nullptr;
++        ID3D11Resource *resource = nullptr;
++    };
++    typedef void(STDMETHODCALLTYPE *PsSetShaderResourcesFn)(ID3D11DeviceContext *, UINT, UINT, ID3D11ShaderResourceView *const *);
++
++    // Attached to each immediate context as private COM data, so its COM references are
++    // released with the context rather than kept in a process-global pointer map.
++    class FinalRgbaContextState final : public IUnknown
++    {
++    public:
++        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
++        {
++            if (out == nullptr) return E_POINTER;
++            *out = nullptr;
++            if (IsEqualIID(iid, IID_IUnknown))
++            {
++                *out = static_cast<IUnknown *>(this);
++                AddRef();
++                return S_OK;
++            }
++            return E_NOINTERFACE;
++        }
++        ULONG STDMETHODCALLTYPE AddRef() override { return ++m_refs; }
++        ULONG STDMETHODCALLTYPE Release() override
++        {
++            const ULONG refs = --m_refs;
++            if (refs == 0) delete this;
++            return refs;
++        }
++
++        ~FinalRgbaContextState() { clear(); }
++
++        void clear()
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            for (ID3D11Resource *&resource : m_targets)
++            {
++                if (resource != nullptr) resource->Release();
++                resource = nullptr;
++            }
++            for (TrackedPsOverride &slot : m_ps_overrides)
++                clear_slot(slot);
++        }
++
++        void set_targets(ID3D11Resource *const *resources, size_t count)
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            for (ID3D11Resource *&resource : m_targets)
++            {
++                if (resource != nullptr) resource->Release();
++                resource = nullptr;
++            }
++            count = (std::min)(count, m_targets.size());
++            for (size_t i = 0; i < count; ++i)
++            {
++                m_targets[i] = resources[i];
++                if (m_targets[i] != nullptr) m_targets[i]->AddRef();
++            }
++        }
++
++        void forget_target(ID3D11Resource *resource)
++        {
++            if (resource == nullptr) return;
++            std::lock_guard<std::mutex> lock(m_mutex);
++            for (ID3D11Resource *&target : m_targets)
++            {
++                if (target == resource)
++                {
++                    target->Release();
++                    target = nullptr;
++                }
++            }
++        }
++
++        void remember_ps(UINT start, UINT count, ID3D11ShaderResourceView *const *originals,
++                         ID3D11ShaderResourceView *const *actuals)
++        {
++            struct NewSlot { ID3D11ShaderResourceView *view; ID3D11Resource *resource; };
++            std::array<NewSlot, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> replacements = {};
++            if (start >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) return;
++            const UINT end = start + (std::min)(count, static_cast<UINT>(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) - start);
++            for (UINT slot = start; slot < end; ++slot)
++            {
++                ID3D11ShaderResourceView *original = originals != nullptr ? originals[slot - start] : nullptr;
++                ID3D11ShaderResourceView *actual = actuals != nullptr ? actuals[slot - start] : nullptr;
++                if (original != nullptr && actual != original)
++                {
++                    ID3D11Resource *resource = nullptr;
++                    original->GetResource(&resource);
++                    if (resource != nullptr)
++                    {
++                        original->AddRef();
++                        replacements[slot].view = original;
++                        replacements[slot].resource = resource; // GetResource returns an owned ref
++                    }
++                }
++            }
++            std::lock_guard<std::mutex> lock(m_mutex);
++            for (UINT slot = start; slot < end; ++slot)
++            {
++                clear_slot(m_ps_overrides[slot]);
++                m_ps_overrides[slot].original = replacements[slot].view;
++                m_ps_overrides[slot].resource = replacements[slot].resource;
++                replacements[slot] = {};
++            }
++            for (NewSlot &slot : replacements)
++            {
++                if (slot.view != nullptr) slot.view->Release();
++                if (slot.resource != nullptr) slot.resource->Release();
++            }
++        }
++
++        void restore_ps_for_resources(ID3D11DeviceContext *context, PsSetShaderResourcesFn original_set,
++                                      ID3D11Resource *const *resources, size_t count)
++        {
++            if (context == nullptr || original_set == nullptr || resources == nullptr || count == 0)
++                return;
++            struct Restore { UINT slot; ID3D11ShaderResourceView *view; };
++            std::vector<Restore> restore;
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                for (UINT slot = 0; slot < m_ps_overrides.size(); ++slot)
++                {
++                    TrackedPsOverride &binding = m_ps_overrides[slot];
++                    bool match = false;
++                    for (size_t i = 0; i < count; ++i)
++                        if (binding.resource != nullptr && binding.resource == resources[i]) { match = true; break; }
++                    if (match)
++                    {
++                        binding.original->AddRef();
++                        restore.push_back({slot, binding.original});
++                        clear_slot(binding);
++                    }
++                }
++            }
++            for (const Restore &item : restore)
++            {
++                ID3D11ShaderResourceView *view = item.view;
++                original_set(context, item.slot, 1, &view);
++                view->Release();
++            }
++        }
++
++        void dirty_targets()
++        {
++            std::array<ID3D11Resource *, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets = {};
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                for (size_t i = 0; i < targets.size(); ++i)
++                {
++                    targets[i] = m_targets[i];
++                    if (targets[i] != nullptr) targets[i]->AddRef();
++                }
++            }
++            for (ID3D11Resource *resource : targets)
++            {
++                if (resource != nullptr)
++                {
++                    mark_final_rgba_dirty(resource, "render-target draw");
++                    forget_target(resource);
++                    resource->Release();
++                }
++            }
++        }
++
++    private:
++        static void clear_slot(TrackedPsOverride &slot)
++        {
++            if (slot.original != nullptr) slot.original->Release();
++            if (slot.resource != nullptr) slot.resource->Release();
++            slot = {};
++        }
++
++        std::atomic<ULONG> m_refs{1};
++        std::mutex m_mutex;
++        std::array<ID3D11Resource *, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> m_targets = {};
++        std::array<TrackedPsOverride, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> m_ps_overrides = {};
++    };
++
++    static FinalRgbaContextState *get_final_rgba_context_state(ID3D11DeviceContext *context, bool create)
++    {
++        if (context == nullptr)
++            return nullptr;
++        dirty_guard_diag("context.GetPrivateData.enter", context);
++        IUnknown *unknown = nullptr;
++        UINT size = sizeof(unknown);
++        const HRESULT get_hr = context->GetPrivateData(s_final_rgba_context_state_guid, &size, &unknown);
++        dirty_guard_diag("context.GetPrivateData.exit", context);
++        if (SUCCEEDED(get_hr) &&
++            size == sizeof(unknown) && unknown != nullptr)
++            return static_cast<FinalRgbaContextState *>(unknown); // GetPrivateData returns an owned interface reference
++        if (!create)
++            return nullptr;
++        auto *state = new (std::nothrow) FinalRgbaContextState();
++        if (state == nullptr)
++            return nullptr;
++        dirty_guard_diag("context.SetPrivateDataInterface.enter", context);
++        const HRESULT hr = context->SetPrivateDataInterface(s_final_rgba_context_state_guid, state);
++        dirty_guard_diag("context.SetPrivateDataInterface.exit", context);
++        if (FAILED(hr))
++        {
++            state->Release();
++            return nullptr;
++        }
++        return state;
++    }
++
++    static bool final_rgba_readback_enabled()
++    {
++        const char *enabled = std::getenv("TT_DGVOODOO_FINAL_RGBA");
++        const bool env_enabled = enabled != nullptr && enabled[0] == '1' && enabled[1] == '\0';
++        if (env_enabled)
++            return true;
++        dirty_guard_diag("config.final_rgba_readback.enter");
++        const bool config_enabled = ConfigManager::get().get_config().final_rgba_readback;
++        dirty_guard_diag("config.final_rgba_readback.exit");
++        return config_enabled;
++    }
++
++    static bool read_final_rgba_state(ID3D11Resource *resource, FinalRgbaCaptureState &state)
++    {
++        UINT size = sizeof(state);
++        return resource != nullptr && SUCCEEDED(resource->GetPrivateData(s_final_rgba_capture_marker, &size, &state)) && size == sizeof(state);
++    }
++
++    static bool is_final_rgba_dirty(ID3D11Resource *resource)
++    {
++        FinalRgbaCaptureState state = {};
++        return read_final_rgba_state(resource, state) && state.dirty != 0;
++    }
++
++    static bool is_final_rgba_captured_clean(ID3D11Resource *resource)
++    {
++        FinalRgbaCaptureState state = {};
++        return read_final_rgba_state(resource, state) && state.complete != 0 && state.dirty == 0;
++    }
++
++    static bool mark_final_rgba_dirty(ID3D11Resource *resource, const char *reason)
++    {
++        if (!final_rgba_readback_enabled() || resource == nullptr)
++            return false;
++        std::lock_guard<std::mutex> lock(s_final_rgba_capture_mutex);
++        FinalRgbaCaptureState state = {};
++        if (!read_final_rgba_state(resource, state) || state.complete == 0)
++            return state.dirty != 0;
++        if (state.dirty != 0)
++            return true;
++        state.dirty = 1;
++        if (FAILED(resource->SetPrivateData(s_final_rgba_capture_marker, sizeof(state), &state)))
++            return false;
++        if (!TextureManager::get().invalidate_final_rgba_resource11(resource))
++        {
++            // Fail closed even when the content tag could not be cleared: the capture marker
++            // remains dirty, and the SRV generation is still advanced by a second attempt.
++            resource->SetPrivateData(s_final_rgba_capture_marker, sizeof(state), &state);
++        }
++        Logger::get().warn(std::string("[FinalRGBAReadback] captured page became mutable; this resource is disabled for injection for this run (reason=") +
++                           (reason != nullptr ? reason : "unknown") + ", resource=" + ptr_hex(resource) + ")");
++        return true;
++    }
++
++    static void prepare_final_rgba_write(ID3D11DeviceContext *context, ID3D11Resource *resource, const char *reason);
++
++    static void capture_final_rgba_array(ID3D11DeviceContext *context, ID3D11ShaderResourceView *srv)
++    {
++        const char *enabled = std::getenv("TT_DGVOODOO_FINAL_RGBA");
++        const bool env_enabled = enabled != nullptr && enabled[0] == '1' && enabled[1] == '\0';
++        if ((!env_enabled && !ConfigManager::get().get_config().final_rgba_readback) || context == nullptr || srv == nullptr ||
++            D3D11Hook::s_inside_injection || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
++            return;
++
++        D3D11_SHADER_RESOURCE_VIEW_DESC view = {};
++        srv->GetDesc(&view);
++        if (view.Format != DXGI_FORMAT_R8G8B8A8_UNORM || view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2DARRAY ||
++            view.Texture2DArray.FirstArraySlice != 0 || view.Texture2DArray.ArraySize != 1 ||
++            view.Texture2DArray.MostDetailedMip != 0 || view.Texture2DArray.MipLevels != 1)
++            return;
++
++        ID3D11Resource *resource = nullptr;
++        srv->GetResource(&resource);
++        if (resource == nullptr)
++            return;
++
++        ID3D11Texture2D *texture = nullptr;
++        if (FAILED(resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&texture))) || texture == nullptr)
++        {
++            resource->Release();
++            return;
++        }
++
++        D3D11_TEXTURE2D_DESC source_desc = {};
++        texture->GetDesc(&source_desc);
++        if (source_desc.Width < 16 || source_desc.Height < 16 || source_desc.Width > 512 || source_desc.Height > 512 ||
++            source_desc.MipLevels != 1 || source_desc.ArraySize != 1 || source_desc.SampleDesc.Count != 1 ||
++            source_desc.Usage != D3D11_USAGE_DEFAULT || source_desc.CPUAccessFlags != 0 ||
++            (source_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 ||
++            (source_desc.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS && source_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM))
++        {
++            texture->Release();
++            resource->Release();
++            return;
++        }
++
++        const size_t resource_bytes = static_cast<size_t>(source_desc.Width) * source_desc.Height * 4u;
++        bool reserved = false;
++        {
++            std::lock_guard<std::mutex> lock(s_final_rgba_capture_mutex);
++            FinalRgbaCaptureState state = {};
++            UINT marker_size = sizeof(state);
++            if (FAILED(resource->GetPrivateData(s_final_rgba_capture_marker, &marker_size, &state)) || marker_size != sizeof(state))
++                state = {};
++            if (state.complete || state.dirty || state.in_progress || state.attempts >= 2 ||
++                s_final_rgba_capture_count >= 128 || s_final_rgba_capture_bytes + resource_bytes > 32u * 1024u * 1024u)
++            {
++                texture->Release();
++                resource->Release();
++                return;
++            }
++            ++state.attempts;
++            state.in_progress = 1;
++            if (FAILED(resource->SetPrivateData(s_final_rgba_capture_marker, sizeof(state), &state)))
++            {
++                texture->Release();
++                resource->Release();
++                return;
++            }
++            s_final_rgba_capture_bytes += resource_bytes;
++            reserved = true;
++        }
++
++        auto finish_attempt = [&](bool success)
++        {
++            if (!reserved)
++                return;
++            std::lock_guard<std::mutex> lock(s_final_rgba_capture_mutex);
++            FinalRgbaCaptureState state = {};
++            UINT marker_size = sizeof(state);
++            if (FAILED(resource->GetPrivateData(s_final_rgba_capture_marker, &marker_size, &state)) || marker_size != sizeof(state))
++                state = {};
++            state.in_progress = 0;
++            state.complete = success ? 1 : 0;
++            resource->SetPrivateData(s_final_rgba_capture_marker, sizeof(state), &state);
++            if (success)
++                ++s_final_rgba_capture_count;
++            else if (s_final_rgba_capture_bytes >= resource_bytes)
++                s_final_rgba_capture_bytes -= resource_bytes;
++            reserved = false;
++        };
++
++        ID3D11Device *device = nullptr;
++        texture->GetDevice(&device);
++        if (device == nullptr)
++        {
++            finish_attempt(false);
++            texture->Release();
++            resource->Release();
++            return;
++        }
++
++        D3D11_TEXTURE2D_DESC staging_desc = source_desc;
++        staging_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // compatible concrete view format for typeless backing
++        staging_desc.Usage = D3D11_USAGE_STAGING;
++        staging_desc.BindFlags = 0;
++        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++        staging_desc.MiscFlags = 0;
++        ID3D11Texture2D *staging = nullptr;
++        HRESULT hr = device->CreateTexture2D(&staging_desc, nullptr, &staging);
++        if (FAILED(hr) || staging == nullptr)
++        {
++            Logger::get().warn("[FinalRGBAReadback] staging creation failed for " + ptr_hex(resource) + " HRESULT=" + std::to_string(hr));
++            finish_attempt(false);
++            device->Release();
++            texture->Release();
++            resource->Release();
++            return;
++        }
++
++        bool registered = false;
++        D3D11_MAPPED_SUBRESOURCE mapped = {};
++        {
++            ScopedFlag no_reentry(D3D11Hook::s_inside_injection);
++            context->CopyResource(staging, texture);
++            hr = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
++            if (SUCCEEDED(hr))
++            {
++                if (mapped.pData != nullptr && mapped.RowPitch >= source_desc.Width * 4u)
++                {
++                    const UINT tight_row = source_desc.Width * 4u;
++                    const uint64_t hash = compute_hash64_rows(static_cast<const uint8_t *>(mapped.pData), mapped.RowPitch,
++                                                              tight_row, source_desc.Height);
++                    Logger::get().info("[FinalRGBAReadback] resource=" + ptr_hex(resource) + " srv=" + ptr_hex(srv) +
++                        " dimensions=" + std::to_string(source_desc.Width) + "x" + std::to_string(source_desc.Height) +
++                        " source_format=" + std::to_string(static_cast<UINT>(source_desc.Format)) +
++                        " row_pitch=" + std::to_string(mapped.RowPitch) + " hash=0x" + format_hash_hex(hash));
++                    registered = hash != 0 && TextureManager::get().register_unmap_texture11(device, resource, mapped.pData,
++                        source_desc.Width, source_desc.Height, DXGI_FORMAT_R8G8B8A8_UNORM, mapped.RowPitch, nullptr, 0, true);
++                }
++                else
++                {
++                    Logger::get().warn("[FinalRGBAReadback] invalid mapped data/pitch for " + ptr_hex(resource) +
++                        " row_pitch=" + std::to_string(mapped.RowPitch));
++                }
++                // A successful Map must always be paired with Unmap, even if pData or pitch is invalid.
++                context->Unmap(staging, 0);
++            }
++        }
++
++        if (FAILED(hr))
++            Logger::get().warn("[FinalRGBAReadback] staging Map failed for " + ptr_hex(resource) + " HRESULT=" + std::to_string(hr));
++        finish_attempt(registered);
++
++        staging->Release();
++        device->Release();
++        texture->Release();
++        resource->Release();
++    }
++
+     // Verbose diagnostics: how the game moves pixels into the textures it draws. Reported from
+     // Present a few times, then left alone.
+     struct CopyDiag
+@@ -299,6 +906,18 @@
+     constexpr int kSlotCopyResource = 47;
+     constexpr int kSlotUpdateSubresource = 48;
+     constexpr int kSlotCSSetShaderResources = 67;
++    constexpr int kSlotDrawIndexed = 12;
++    constexpr int kSlotDraw = 13;
++    constexpr int kSlotDrawIndexedInstanced = 20;
++    constexpr int kSlotDrawInstanced = 21;
++    constexpr int kSlotOMSetRenderTargets = 33;
++    constexpr int kSlotOMSetRenderTargetsAndUAVs = 34;
++    constexpr int kSlotDrawAuto = 38;
++    constexpr int kSlotDrawIndexedInstancedIndirect = 39;
++    constexpr int kSlotDrawInstancedIndirect = 40;
++    constexpr int kSlotClearRenderTargetView = 50;
++    constexpr int kSlotClearState = 110;
++    constexpr int kSlotClearView = 132; // ID3D11DeviceContext1
+ 
+     static SlotHooks<PresentFn> s_present_hooks;
+     static SlotHooks<Present1Fn> s_present1_hooks;
+@@ -309,6 +928,359 @@
+     {
+         return (*reinterpret_cast<void ***>(object))[index];
+     }
++
++    static void prepare_final_rgba_write(ID3D11DeviceContext *context, ID3D11Resource *resource, const char *reason)
++    {
++        if (D3D11Hook::s_inside_injection || !mark_final_rgba_dirty(resource, reason))
++            return;
++        if (FinalRgbaContextState *state = get_final_rgba_context_state(context, false))
++        {
++            state->forget_target(resource);
++            const PsSetShaderResourcesFn original = s_ps_srv_hooks.find(vtable_slot(context, kSlotPSSetShaderResources));
++            state->restore_ps_for_resources(context, original, &resource, 1);
++            state->Release();
++        }
++    }
++
++    typedef void(STDMETHODCALLTYPE *DrawFn)(ID3D11DeviceContext *, UINT, UINT);
++    typedef void(STDMETHODCALLTYPE *DrawIndexedFn)(ID3D11DeviceContext *, UINT, UINT, INT);
++    typedef void(STDMETHODCALLTYPE *DrawInstancedFn)(ID3D11DeviceContext *, UINT, UINT, UINT, UINT);
++    typedef void(STDMETHODCALLTYPE *DrawIndexedInstancedFn)(ID3D11DeviceContext *, UINT, UINT, UINT, INT, UINT);
++    typedef void(STDMETHODCALLTYPE *DrawAutoFn)(ID3D11DeviceContext *);
++    typedef void(STDMETHODCALLTYPE *DrawIndirectFn)(ID3D11DeviceContext *, ID3D11Buffer *, UINT);
++    typedef void(STDMETHODCALLTYPE *OMSetRenderTargetsFn)(ID3D11DeviceContext *, UINT, ID3D11RenderTargetView *const *, ID3D11DepthStencilView *);
++    typedef void(STDMETHODCALLTYPE *OMSetRenderTargetsAndUAVsFn)(ID3D11DeviceContext *, UINT, ID3D11RenderTargetView *const *, ID3D11DepthStencilView *, UINT, UINT, ID3D11UnorderedAccessView *const *, const UINT *);
++    typedef void(STDMETHODCALLTYPE *ClearRenderTargetViewFn)(ID3D11DeviceContext *, ID3D11RenderTargetView *, const FLOAT[4]);
++    typedef void(STDMETHODCALLTYPE *ClearStateFn)(ID3D11DeviceContext *);
++    typedef void(STDMETHODCALLTYPE *ClearViewFn)(ID3D11DeviceContext1 *, ID3D11View *, const FLOAT[4], const D3D11_RECT *, UINT);
++
++    static SlotHooks<DrawFn> s_draw_hooks;
++    static SlotHooks<DrawIndexedFn> s_draw_indexed_hooks;
++    static SlotHooks<DrawInstancedFn> s_draw_instanced_hooks;
++    static SlotHooks<DrawIndexedInstancedFn> s_draw_indexed_instanced_hooks;
++    static SlotHooks<DrawAutoFn> s_draw_auto_hooks;
++    static SlotHooks<DrawIndirectFn> s_draw_indexed_indirect_hooks;
++    static SlotHooks<DrawIndirectFn> s_draw_indirect_hooks;
++    static SlotHooks<OMSetRenderTargetsFn> s_om_set_render_targets_hooks;
++    static SlotHooks<OMSetRenderTargetsAndUAVsFn> s_om_set_render_targets_uavs_hooks;
++    static SlotHooks<ClearRenderTargetViewFn> s_clear_rtv_hooks;
++    static SlotHooks<ClearStateFn> s_clear_state_hooks;
++    static SlotHooks<ClearViewFn> s_clear_view_hooks;
++
++    static void collect_captured_targets(UINT count, ID3D11RenderTargetView *const *views,
++                                         std::array<ID3D11Resource *, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> &resources,
++                                         size_t &resource_count)
++    {
++        resource_count = 0;
++        if (views == nullptr) return;
++        count = (std::min)(count, static_cast<UINT>(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT));
++        for (UINT i = 0; i < count; ++i)
++        {
++            if (views[i] == nullptr) continue;
++            ID3D11Resource *resource = nullptr;
++            views[i]->GetResource(&resource);
++            if (resource != nullptr && is_final_rgba_captured_clean(resource))
++                resources[resource_count++] = resource; // GetResource returned an owned ref
++            else if (resource != nullptr)
++                resource->Release();
++        }
++    }
++
++    static void restore_ps_for_targets(ID3D11DeviceContext *context, ID3D11Resource *const *resources, size_t count)
++    {
++        if (count == 0) return;
++        FinalRgbaContextState *state = get_final_rgba_context_state(context, true);
++        if (state == nullptr)
++        {
++            s_final_rgba_tracking_unavailable.store(true, std::memory_order_relaxed);
++            Logger::get().error("[FinalRGBAReadback] cannot attach per-context mutation guard; captured RTVs disabled before draw");
++            for (size_t i = 0; i < count; ++i)
++                mark_final_rgba_dirty(resources[i], "context tracking unavailable");
++            return;
++        }
++        const PsSetShaderResourcesFn original = s_ps_srv_hooks.find(vtable_slot(context, kSlotPSSetShaderResources));
++        state->restore_ps_for_resources(context, original, resources, count);
++        state->Release();
++    }
++
++    static void remember_context_targets(ID3D11DeviceContext *context, ID3D11Resource *const *resources, size_t count)
++    {
++        FinalRgbaContextState *state = get_final_rgba_context_state(context, count != 0);
++        if (state == nullptr)
++        {
++            if (count != 0)
++            {
++                s_final_rgba_tracking_unavailable.store(true, std::memory_order_relaxed);
++                for (size_t i = 0; i < count; ++i)
++                    mark_final_rgba_dirty(resources[i], "context tracking unavailable");
++            }
++            return;
++        }
++        state->set_targets(resources, count);
++        state->Release();
++    }
++
++    static void dirty_current_targets(ID3D11DeviceContext *context)
++    {
++        if (!final_rgba_readback_enabled() || D3D11Hook::s_inside_injection) return;
++        FinalRgbaContextState *state = get_final_rgba_context_state(context, false);
++        if (state != nullptr)
++        {
++            state->dirty_targets();
++            state->Release();
++        }
++    }
++
++    static void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(ID3D11DeviceContext *context, UINT count,
++                                                              ID3D11RenderTargetView *const *views,
++                                                              ID3D11DepthStencilView *depth)
++    {
++        dirty_guard_diag("OMSetRenderTargets.enter", context);
++        const OMSetRenderTargetsFn original = s_om_set_render_targets_hooks.current_original();
++        dirty_guard_diag("OMSetRenderTargets.original.ptr", reinterpret_cast<const void *>(original));
++        if (original == nullptr) { dirty_guard_diag("OMSetRenderTargets.no-original", context); return; }
++        std::array<ID3D11Resource *, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets = {};
++        size_t target_count = 0;
++        dirty_guard_diag("OMSetRenderTargets.collect.enter", context);
++        collect_captured_targets(count, views, targets, target_count);
++        dirty_guard_diag("OMSetRenderTargets.collect.exit", context);
++        restore_ps_for_targets(context, targets.data(), target_count);
++        dirty_guard_diag("OMSetRenderTargets.original.enter", context);
++        original(context, count, views, depth);
++        dirty_guard_diag("OMSetRenderTargets.original.exit", context);
++        remember_context_targets(context, targets.data(), target_count);
++        for (size_t i = 0; i < target_count; ++i) targets[i]->Release();
++        dirty_guard_diag("OMSetRenderTargets.exit", context);
++    }
++
++    static void STDMETHODCALLTYPE Hooked_OMSetRenderTargetsAndUAVs(ID3D11DeviceContext *context, UINT count,
++        ID3D11RenderTargetView *const *views, ID3D11DepthStencilView *depth, UINT uav_start, UINT uav_count,
++        ID3D11UnorderedAccessView *const *uavs, const UINT *initial_counts)
++    {
++        dirty_guard_diag("OMSetRenderTargetsAndUAVs.enter", context);
++        const OMSetRenderTargetsAndUAVsFn original = s_om_set_render_targets_uavs_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("OMSetRenderTargetsAndUAVs.no-original", context); return; }
++        std::array<ID3D11Resource *, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets = {};
++        size_t target_count = 0;
++        const bool keep_rt = count == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL;
++        if (!keep_rt) collect_captured_targets(count, views, targets, target_count);
++        if (!keep_rt) restore_ps_for_targets(context, targets.data(), target_count);
++        dirty_guard_diag("OMSetRenderTargetsAndUAVs.original.enter", context);
++        original(context, count, views, depth, uav_start, uav_count, uavs, initial_counts);
++        dirty_guard_diag("OMSetRenderTargetsAndUAVs.original.exit", context);
++        if (!keep_rt) remember_context_targets(context, targets.data(), target_count);
++        for (size_t i = 0; i < target_count; ++i) targets[i]->Release();
++        dirty_guard_diag("OMSetRenderTargetsAndUAVs.exit", context);
++    }
++
++    static void STDMETHODCALLTYPE Hooked_Draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex)
++    {
++        dirty_guard_diag("Draw.enter", context);
++        const DrawFn original = s_draw_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("Draw.no-original", context); return; }
++        original(context, vertex_count, start_vertex);
++        dirty_guard_diag("Draw.original.exit", context);
++        dirty_current_targets(context);
++        dirty_guard_diag("Draw.exit", context);
++    }
++    static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index, INT base_vertex)
++    {
++        dirty_guard_diag("DrawIndexed.enter", context);
++        const DrawIndexedFn original = s_draw_indexed_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("DrawIndexed.no-original", context); return; }
++        original(context, index_count, start_index, base_vertex);
++        dirty_guard_diag("DrawIndexed.original.exit", context);
++        dirty_current_targets(context);
++        dirty_guard_diag("DrawIndexed.exit", context);
++    }
++    static void STDMETHODCALLTYPE Hooked_DrawInstanced(ID3D11DeviceContext *context, UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance)
++    {
++        dirty_guard_diag("DrawInstanced.enter", context);
++        const DrawInstancedFn original = s_draw_instanced_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("DrawInstanced.no-original", context); return; }
++        original(context, vertex_count, instance_count, start_vertex, start_instance);
++        dirty_guard_diag("DrawInstanced.original.exit", context);
++        dirty_current_targets(context);
++        dirty_guard_diag("DrawInstanced.exit", context);
++    }
++    static void STDMETHODCALLTYPE Hooked_DrawIndexedInstanced(ID3D11DeviceContext *context, UINT index_count, UINT instance_count, UINT start_index, INT base_vertex, UINT start_instance)
++    {
++        dirty_guard_diag("DrawIndexedInstanced.enter", context);
++        const DrawIndexedInstancedFn original = s_draw_indexed_instanced_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("DrawIndexedInstanced.no-original", context); return; }
++        original(context, index_count, instance_count, start_index, base_vertex, start_instance);
++        dirty_guard_diag("DrawIndexedInstanced.original.exit", context);
++        dirty_current_targets(context);
++        dirty_guard_diag("DrawIndexedInstanced.exit", context);
++    }
++    static void STDMETHODCALLTYPE Hooked_DrawAuto(ID3D11DeviceContext *context)
++    {
++        dirty_guard_diag("DrawAuto.enter", context);
++        const DrawAutoFn original = s_draw_auto_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("DrawAuto.no-original", context); return; }
++        original(context);
++        dirty_guard_diag("DrawAuto.original.exit", context);
++        dirty_current_targets(context);
++        dirty_guard_diag("DrawAuto.exit", context);
++    }
++    static void STDMETHODCALLTYPE Hooked_DrawIndexedInstancedIndirect(ID3D11DeviceContext *context, ID3D11Buffer *buffer, UINT offset)
++    {
++        dirty_guard_diag("DrawIndexedInstancedIndirect.enter", context);
++        const DrawIndirectFn original = s_draw_indexed_indirect_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("DrawIndexedInstancedIndirect.no-original", context); return; }
++        original(context, buffer, offset);
++        dirty_guard_diag("DrawIndexedInstancedIndirect.original.exit", context);
++        dirty_current_targets(context);
++        dirty_guard_diag("DrawIndexedInstancedIndirect.exit", context);
++    }
++    static void STDMETHODCALLTYPE Hooked_DrawInstancedIndirect(ID3D11DeviceContext *context, ID3D11Buffer *buffer, UINT offset)
++    {
++        dirty_guard_diag("DrawInstancedIndirect.enter", context);
++        const DrawIndirectFn original = s_draw_indirect_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("DrawInstancedIndirect.no-original", context); return; }
++        original(context, buffer, offset);
++        dirty_guard_diag("DrawInstancedIndirect.original.exit", context);
++        dirty_current_targets(context);
++        dirty_guard_diag("DrawInstancedIndirect.exit", context);
++    }
++
++    static void STDMETHODCALLTYPE Hooked_ClearRenderTargetView(ID3D11DeviceContext *context, ID3D11RenderTargetView *view, const FLOAT color[4])
++    {
++        dirty_guard_diag("ClearRenderTargetView.enter", context);
++        const ClearRenderTargetViewFn original = s_clear_rtv_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("ClearRenderTargetView.no-original", context); return; }
++        ID3D11Resource *resource = nullptr;
++        if (view != nullptr) view->GetResource(&resource);
++        if (resource != nullptr) prepare_final_rgba_write(context, resource, "ClearRenderTargetView");
++        dirty_guard_diag("ClearRenderTargetView.original.enter", context);
++        original(context, view, color);
++        dirty_guard_diag("ClearRenderTargetView.original.exit", context);
++        if (resource != nullptr) resource->Release();
++        dirty_guard_diag("ClearRenderTargetView.exit", context);
++    }
++
++    static void STDMETHODCALLTYPE Hooked_ClearView(ID3D11DeviceContext1 *context, ID3D11View *view,
++                                                     const FLOAT color[4], const D3D11_RECT *rects, UINT count)
++    {
++        dirty_guard_diag("ClearView.enter", context);
++        const ClearViewFn original = s_clear_view_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("ClearView.no-original", context); return; }
++        ID3D11Resource *resource = nullptr;
++        if (view != nullptr) view->GetResource(&resource);
++        if (resource != nullptr) prepare_final_rgba_write(context, resource, "ClearView");
++        dirty_guard_diag("ClearView.original.enter", context);
++        original(context, view, color, rects, count);
++        dirty_guard_diag("ClearView.original.exit", context);
++        if (resource != nullptr) resource->Release();
++        dirty_guard_diag("ClearView.exit", context);
++    }
++
++    static void STDMETHODCALLTYPE Hooked_ClearState(ID3D11DeviceContext *context)
++    {
++        dirty_guard_diag("ClearState.enter", context);
++        const ClearStateFn original = s_clear_state_hooks.current_original();
++        if (original == nullptr) { dirty_guard_diag("ClearState.no-original", context); return; }
++        original(context);
++        dirty_guard_diag("ClearState.original.exit", context);
++        if (FinalRgbaContextState *state = get_final_rgba_context_state(context, false))
++        {
++            state->clear();
++            state->Release();
++        }
++        dirty_guard_diag("ClearState.exit", context);
++    }
++
++    // Generate one detour thunk per implementation. A wrapper may call a second
++    // vtable implementation internally; the thunk supplies its own trampoline to
++    // the common handler instead of re-selecting by the object's current vtable.
++#define TT_UNPAREN(...) __VA_ARGS__
++#define TT_INDEXED_THUNK(prefix, handler, hooks, FnType, index, params, args) \
++    static void STDMETHODCALLTYPE prefix##_thunk_##index params { \
++        const FnType next = hooks.find_index(index); \
++        if (next == nullptr) return; \
++        const FnType previous = hooks.exchange_original(next); \
++        handler args; \
++        hooks.exchange_original(previous); \
++    }
++#define TT_INDEXED_THUNKS(prefix, handler, hooks, FnType, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 0, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 1, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 2, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 3, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 4, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 5, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 6, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 7, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 8, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 9, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 10, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 11, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 12, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 13, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 14, params, args) \
++    TT_INDEXED_THUNK(prefix, handler, hooks, FnType, 15, params, args)
++#define TT_THUNK_ADDRESS(prefix, index) reinterpret_cast<void *>(&prefix##_thunk_##index)
++#define TT_INDEXED_THUNK_ARRAY(prefix) \
++    std::array<void *, 16>{TT_THUNK_ADDRESS(prefix, 0), TT_THUNK_ADDRESS(prefix, 1), \
++        TT_THUNK_ADDRESS(prefix, 2), TT_THUNK_ADDRESS(prefix, 3), TT_THUNK_ADDRESS(prefix, 4), \
++        TT_THUNK_ADDRESS(prefix, 5), TT_THUNK_ADDRESS(prefix, 6), TT_THUNK_ADDRESS(prefix, 7), \
++        TT_THUNK_ADDRESS(prefix, 8), TT_THUNK_ADDRESS(prefix, 9), TT_THUNK_ADDRESS(prefix, 10), \
++        TT_THUNK_ADDRESS(prefix, 11), TT_THUNK_ADDRESS(prefix, 12), TT_THUNK_ADDRESS(prefix, 13), \
++        TT_THUNK_ADDRESS(prefix, 14), TT_THUNK_ADDRESS(prefix, 15)}
++
++    TT_INDEXED_THUNKS(om_set_rt, Hooked_OMSetRenderTargets, s_om_set_render_targets_hooks,
++        OMSetRenderTargetsFn,
++        (ID3D11DeviceContext *context, UINT count, ID3D11RenderTargetView *const *views, ID3D11DepthStencilView *depth),
++        (context, count, views, depth))
++    TT_INDEXED_THUNKS(om_set_rt_uav, Hooked_OMSetRenderTargetsAndUAVs, s_om_set_render_targets_uavs_hooks,
++        OMSetRenderTargetsAndUAVsFn,
++        (ID3D11DeviceContext *context, UINT count, ID3D11RenderTargetView *const *views,
++         ID3D11DepthStencilView *depth, UINT uav_start, UINT uav_count,
++         ID3D11UnorderedAccessView *const *uavs, const UINT *initial_counts),
++        (context, count, views, depth, uav_start, uav_count, uavs, initial_counts))
++    TT_INDEXED_THUNKS(draw, Hooked_Draw, s_draw_hooks, DrawFn,
++        (ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex), (context, vertex_count, start_vertex))
++    TT_INDEXED_THUNKS(draw_indexed, Hooked_DrawIndexed, s_draw_indexed_hooks, DrawIndexedFn,
++        (ID3D11DeviceContext *context, UINT index_count, UINT start_index, INT base_vertex),
++        (context, index_count, start_index, base_vertex))
++    TT_INDEXED_THUNKS(draw_instanced, Hooked_DrawInstanced, s_draw_instanced_hooks, DrawInstancedFn,
++        (ID3D11DeviceContext *context, UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance),
++        (context, vertex_count, instance_count, start_vertex, start_instance))
++    TT_INDEXED_THUNKS(draw_indexed_instanced, Hooked_DrawIndexedInstanced, s_draw_indexed_instanced_hooks,
++        DrawIndexedInstancedFn,
++        (ID3D11DeviceContext *context, UINT index_count, UINT instance_count, UINT start_index,
++         INT base_vertex, UINT start_instance),
++        (context, index_count, instance_count, start_index, base_vertex, start_instance))
++    TT_INDEXED_THUNKS(draw_auto, Hooked_DrawAuto, s_draw_auto_hooks, DrawAutoFn, (ID3D11DeviceContext *context), (context))
++    TT_INDEXED_THUNKS(draw_indexed_indirect, Hooked_DrawIndexedInstancedIndirect, s_draw_indexed_indirect_hooks,
++        DrawIndirectFn, (ID3D11DeviceContext *context, ID3D11Buffer *buffer, UINT offset), (context, buffer, offset))
++    TT_INDEXED_THUNKS(draw_indirect, Hooked_DrawInstancedIndirect, s_draw_indirect_hooks,
++        DrawIndirectFn, (ID3D11DeviceContext *context, ID3D11Buffer *buffer, UINT offset), (context, buffer, offset))
++    TT_INDEXED_THUNKS(clear_rtv, Hooked_ClearRenderTargetView, s_clear_rtv_hooks, ClearRenderTargetViewFn,
++        (ID3D11DeviceContext *context, ID3D11RenderTargetView *view, const FLOAT color[4]), (context, view, color))
++    TT_INDEXED_THUNKS(clear_state, Hooked_ClearState, s_clear_state_hooks, ClearStateFn,
++        (ID3D11DeviceContext *context), (context))
++    TT_INDEXED_THUNKS(clear_view, Hooked_ClearView, s_clear_view_hooks, ClearViewFn,
++        (ID3D11DeviceContext1 *context, ID3D11View *view, const FLOAT color[4],
++         const D3D11_RECT *rects, UINT count), (context, view, color, rects, count))
++
++    static const auto s_om_set_rt_thunks = TT_INDEXED_THUNK_ARRAY(om_set_rt);
++    static const auto s_om_set_rt_uav_thunks = TT_INDEXED_THUNK_ARRAY(om_set_rt_uav);
++    static const auto s_draw_thunks = TT_INDEXED_THUNK_ARRAY(draw);
++    static const auto s_draw_indexed_thunks = TT_INDEXED_THUNK_ARRAY(draw_indexed);
++    static const auto s_draw_instanced_thunks = TT_INDEXED_THUNK_ARRAY(draw_instanced);
++    static const auto s_draw_indexed_instanced_thunks = TT_INDEXED_THUNK_ARRAY(draw_indexed_instanced);
++    static const auto s_draw_auto_thunks = TT_INDEXED_THUNK_ARRAY(draw_auto);
++    static const auto s_draw_indexed_indirect_thunks = TT_INDEXED_THUNK_ARRAY(draw_indexed_indirect);
++    static const auto s_draw_indirect_thunks = TT_INDEXED_THUNK_ARRAY(draw_indirect);
++    static const auto s_clear_rtv_thunks = TT_INDEXED_THUNK_ARRAY(clear_rtv);
++    static const auto s_clear_state_thunks = TT_INDEXED_THUNK_ARRAY(clear_state);
++    static const auto s_clear_view_thunks = TT_INDEXED_THUNK_ARRAY(clear_view);
++
++#undef TT_INDEXED_THUNK_ARRAY
++#undef TT_THUNK_ADDRESS
++#undef TT_INDEXED_THUNKS
++#undef TT_INDEXED_THUNK
+ 
+     // Present and Present1 can be layered inside the runtime, one calling the other. The overlay is
+     // drawn once per frame, by whichever the game called, and nested calls only forward.
+@@ -414,6 +1386,9 @@
+     {
+         if (context == nullptr)
+             return;
++
++        dirty_guard_diag("hook_context.vtable.slot33.OMSetRenderTargets", vtable_slot(context, kSlotOMSetRenderTargets));
++        dirty_guard_diag("hook_context.vtable.slot34.OMSetRenderTargetsAndUAVs", vtable_slot(context, kSlotOMSetRenderTargetsAndUAVs));
+ 
+         // Every implementation, not only the first context seen: see the context tables above.
+         // PSSetShaderResources answers whether this implementation is new; the rest follow it.
+@@ -426,12 +1401,24 @@
+         s_copy_region_hooks.add(vtable_slot(context, kSlotCopySubresourceRegion), reinterpret_cast<void *>(&Hooked_CopySubresourceRegion));
+         s_copy_resource_hooks.add(vtable_slot(context, kSlotCopyResource), reinterpret_cast<void *>(&Hooked_CopyResource));
+         s_update_subresource_hooks.add(vtable_slot(context, kSlotUpdateSubresource), reinterpret_cast<void *>(&Hooked_UpdateSubresource));
++        s_draw_indexed_hooks.add_indexed(vtable_slot(context, kSlotDrawIndexed), s_draw_indexed_thunks);
++        s_draw_hooks.add_indexed(vtable_slot(context, kSlotDraw), s_draw_thunks);
++        s_draw_indexed_instanced_hooks.add_indexed(vtable_slot(context, kSlotDrawIndexedInstanced), s_draw_indexed_instanced_thunks);
++        s_draw_instanced_hooks.add_indexed(vtable_slot(context, kSlotDrawInstanced), s_draw_instanced_thunks);
++        s_om_set_render_targets_hooks.add_indexed(vtable_slot(context, kSlotOMSetRenderTargets), s_om_set_rt_thunks);
++        s_om_set_render_targets_uavs_hooks.add_indexed(vtable_slot(context, kSlotOMSetRenderTargetsAndUAVs), s_om_set_rt_uav_thunks);
++        s_draw_auto_hooks.add_indexed(vtable_slot(context, kSlotDrawAuto), s_draw_auto_thunks);
++        s_draw_indexed_indirect_hooks.add_indexed(vtable_slot(context, kSlotDrawIndexedInstancedIndirect), s_draw_indexed_indirect_thunks);
++        s_draw_indirect_hooks.add_indexed(vtable_slot(context, kSlotDrawInstancedIndirect), s_draw_indirect_thunks);
++        s_clear_rtv_hooks.add_indexed(vtable_slot(context, kSlotClearRenderTargetView), s_clear_rtv_thunks);
++        s_clear_state_hooks.add_indexed(vtable_slot(context, kSlotClearState), s_clear_state_thunks);
+ 
+         ID3D11DeviceContext1 *context1 = nullptr;
+         if (SUCCEEDED(context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&context1))) && context1 != nullptr)
+         {
+             s_copy_region1_hooks.add(vtable_slot(context1, kSlotCopySubresourceRegion1), reinterpret_cast<void *>(&Hooked_CopySubresourceRegion1));
+             s_update_subresource1_hooks.add(vtable_slot(context1, kSlotUpdateSubresource1), reinterpret_cast<void *>(&Hooked_UpdateSubresource1));
++            s_clear_view_hooks.add_indexed(vtable_slot(context1, kSlotClearView), s_clear_view_thunks);
+             context1->Release();
+         }
+ 
+@@ -987,7 +1974,7 @@
+         return hr;
+     }
+ 
+-    void D3D11Hook::bind_shader_resources(SetShaderResources_t original, ID3D11DeviceContext *context, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews)
++    void D3D11Hook::bind_shader_resources(SetShaderResources_t original, ID3D11DeviceContext *context, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews, bool track_final_rgba_ps)
+     {
+         if (original == nullptr)
+             return;
+@@ -997,6 +1984,14 @@
+         if (ppShaderResourceViews == nullptr || NumViews == 0 || s_inside_injection)
+         {
+             original(context, StartSlot, NumViews, ppShaderResourceViews);
++            if (track_final_rgba_ps && !s_inside_injection)
++            {
++                if (FinalRgbaContextState *state = get_final_rgba_context_state(context, false))
++                {
++                    state->remember_ps(StartSlot, NumViews, ppShaderResourceViews, ppShaderResourceViews);
++                    state->Release();
++                }
++            }
+             return;
+         }
+ 
+@@ -1008,11 +2003,25 @@
+         s_replaced.resize(NumViews);
+ 
+         bool any_replaced = false;
++        bool any_final_rgba_replaced = false;
+         {
+             HookTimings::Scope timing(HookTimings::Site::D3D11Bind);
+             for (UINT i = 0; i < NumViews; ++i)
+             {
+-                ID3D11ShaderResourceView *r = TextureManager::get().get_replacement_srv11(ppShaderResourceViews[i]);
++                ID3D11ShaderResourceView *r = ppShaderResourceViews[i];
++                if (r != nullptr)
++                {
++                    ID3D11Resource *resource = nullptr;
++                    r->GetResource(&resource);
++                    const bool dirty = is_final_rgba_dirty(resource);
++                    FinalRgbaCaptureState capture_state = {};
++                    const bool is_final_rgba = read_final_rgba_state(resource, capture_state) && capture_state.complete != 0;
++                    if (resource != nullptr) resource->Release();
++                    if (!dirty && !(is_final_rgba && s_final_rgba_tracking_unavailable.load(std::memory_order_relaxed)))
++                        r = TextureManager::get().get_replacement_srv11(ppShaderResourceViews[i]);
++                    if (track_final_rgba_ps && is_final_rgba && !dirty && r != ppShaderResourceViews[i])
++                        any_final_rgba_replaced = true;
++                }
+                 s_replaced[i] = r;
+                 if (r != ppShaderResourceViews[i])
+                     any_replaced = true;
+@@ -1021,11 +2030,39 @@
+ 
+         original(context, StartSlot, NumViews,
+             any_replaced ? s_replaced.data() : ppShaderResourceViews);
++        if (track_final_rgba_ps)
++        {
++            // Context private-data setup is only needed when a captured final-RGBA page
++            // actually receives a replacement. Creating it on the first ordinary PS bind
++            // runs SetPrivateDataInterface from inside Wine's context callback during
++            // device bootstrap; some wrappers deadlock there. If state already exists,
++            // still update the slots so later writes cannot restore a superseded binding.
++            FinalRgbaContextState *state = get_final_rgba_context_state(context, any_final_rgba_replaced);
++            if (state != nullptr)
++            {
++                state->remember_ps(StartSlot, NumViews, ppShaderResourceViews,
++                                   any_replaced ? s_replaced.data() : ppShaderResourceViews);
++                state->Release();
++            }
++            else if (any_final_rgba_replaced)
++            {
++                s_final_rgba_tracking_unavailable.store(true, std::memory_order_relaxed);
++                Logger::get().error("[FinalRGBAReadback] cannot attach per-context mutation guard; final-RGBA replacement is disabled");
++            }
++        }
+     }
+ 
+     void STDMETHODCALLTYPE D3D11Hook::Hooked_PSSetShaderResources(ID3D11DeviceContext *context, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews)
+     {
+-        bind_shader_resources(s_ps_srv_hooks.find(vtable_slot(context, kSlotPSSetShaderResources)), context, StartSlot, NumViews, ppShaderResourceViews);
++        // Log first-seen PS resources with the RTV bound at the same moment. This lets an
++        // isolated run correlate a conversion pass's input/output resource identities.
++        log_texture_bind_diagnostic(context, StartSlot, NumViews, ppShaderResourceViews);
++        if (ppShaderResourceViews != nullptr)
++        {
++            for (UINT i = 0; i < NumViews; ++i)
++                capture_final_rgba_array(context, ppShaderResourceViews[i]);
++        }
++        bind_shader_resources(s_ps_srv_hooks.find(vtable_slot(context, kSlotPSSetShaderResources)), context, StartSlot, NumViews, ppShaderResourceViews, true);
+     }
+ 
+     // A texture sampled by a vertex or compute shader never reached the pixel stage, so it was
+@@ -1053,12 +2090,13 @@
+     // ---------------------------------------------------------------------------------------
+     void STDMETHODCALLTYPE D3D11Hook::Hooked_CopyResource(ID3D11DeviceContext *context, ID3D11Resource *pDstResource, ID3D11Resource *pSrcResource)
+     {
++        prepare_final_rgba_write(context, pDstResource, "CopyResource");
+         if (const CopyResourceFn original = s_copy_resource_hooks.find(vtable_slot(context, kSlotCopyResource)))
+             original(context, pDstResource, pSrcResource);
+         else
+             return;
+         s_copy_diag.copy_resource.fetch_add(1, std::memory_order_relaxed);
+-        if (!s_inside_injection && TextureManager::get().copy_tag11(pSrcResource, pDstResource))
++        if (!s_inside_injection && !is_final_rgba_dirty(pDstResource) && TextureManager::get().copy_tag11(pSrcResource, pDstResource))
+             s_copy_diag.tag_carried.fetch_add(1, std::memory_order_relaxed);
+     }
+ 
+@@ -1066,6 +2104,7 @@
+                                                                    UINT DstX, UINT DstY, UINT DstZ, ID3D11Resource *pSrcResource,
+                                                                    UINT SrcSubresource, const D3D11_BOX *pSrcBox)
+     {
++        prepare_final_rgba_write(context, pDstResource, "CopySubresourceRegion");
+         if (const CopyRegionFn original = s_copy_region_hooks.find(vtable_slot(context, kSlotCopySubresourceRegion)))
+             original(context, pDstResource, DstSubresource, DstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox);
+         else
+@@ -1078,6 +2117,7 @@
+                                                                     UINT DstX, UINT DstY, UINT DstZ, ID3D11Resource *pSrcResource,
+                                                                     UINT SrcSubresource, const D3D11_BOX *pSrcBox, UINT CopyFlags)
+     {
++        prepare_final_rgba_write(context, pDstResource, "CopySubresourceRegion1");
+         if (const CopyRegion1Fn original = s_copy_region1_hooks.find(vtable_slot(context, kSlotCopySubresourceRegion1)))
+             original(context, pDstResource, DstSubresource, DstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox, CopyFlags);
+         else
+@@ -1112,7 +2152,7 @@
+     void D3D11Hook::carry_region_tag(ID3D11Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, UINT DstZ,
+                                      ID3D11Resource *pSrcResource, UINT SrcSubresource, const D3D11_BOX *pSrcBox)
+     {
+-        if (s_inside_injection || DstSubresource != 0 || SrcSubresource != 0 || DstX != 0 || DstY != 0 || DstZ != 0)
++        if (s_inside_injection || is_final_rgba_dirty(pDstResource) || DstSubresource != 0 || SrcSubresource != 0 || DstX != 0 || DstY != 0 || DstZ != 0)
+             return;
+ 
+         // A whole copy: all of the source's top level, into a texture of exactly that size. A tile
+@@ -1136,6 +2176,7 @@
+                                                                const D3D11_BOX *pDstBox, const void *pSrcData, UINT SrcRowPitch,
+                                                                UINT SrcDepthPitch)
+     {
++        prepare_final_rgba_write(context, pDstResource, "UpdateSubresource");
+         if (const UpdateSubresourceFn original = s_update_subresource_hooks.find(vtable_slot(context, kSlotUpdateSubresource)))
+             original(context, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
+         else
+@@ -1148,6 +2189,7 @@
+                                                                 const D3D11_BOX *pDstBox, const void *pSrcData, UINT SrcRowPitch,
+                                                                 UINT SrcDepthPitch, UINT CopyFlags)
+     {
++        prepare_final_rgba_write(context, pDstResource, "UpdateSubresource1");
+         if (const UpdateSubresource1Fn original = s_update_subresource1_hooks.find(vtable_slot(context, kSlotUpdateSubresource1)))
+             original(context, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
+         else
+@@ -1159,7 +2201,7 @@
+     void D3D11Hook::register_update(ID3D11DeviceContext *context, ID3D11Resource *pDstResource, UINT DstSubresource,
+                                     const D3D11_BOX *pDstBox, const void *pSrcData, UINT SrcRowPitch)
+     {
+-        if (s_inside_injection || pSrcData == nullptr || pDstResource == nullptr)
++        if (s_inside_injection || pSrcData == nullptr || pDstResource == nullptr || is_final_rgba_dirty(pDstResource))
+             return;
+ 
+         // Buffers (constant buffers above all) arrive here far more often than textures do.
+@@ -1198,6 +2240,9 @@
+         if (original == nullptr)
+             return E_FAIL; // hooked but unpublished: cannot happen, and must not guess
+         HRESULT hr = original(context, pResource, Subresource, MapType, MapFlags, pMappedResource);
++
++        if (SUCCEEDED(hr) && !s_inside_injection && Subresource == 0 && MapType != D3D11_MAP_READ)
++            prepare_final_rgba_write(context, pResource, "Map(write)");
+ 
+         // Skip our own staging Map during a dump/injection readback (see dump_resource11).
+         if (SUCCEEDED(hr) && !s_inside_injection && Subresource == 0 && pMappedResource != nullptr && pMappedResource->pData != nullptr)
+@@ -1259,7 +2304,7 @@
+ 
+             if (held != nullptr)
+             {
+-                if (!s_inside_injection && data.mapped.pData != nullptr)
++                if (!s_inside_injection && data.mapped.pData != nullptr && !is_final_rgba_dirty(pResource))
+                 {
+                     ID3D11Texture2D *tex = static_cast<ID3D11Texture2D *>(pResource);
+                     D3D11_TEXTURE2D_DESC desc = {};
+
+--- a/src/D3D11Hook.h
++++ b/src/D3D11Hook.h
+@@ -109,7 +109,7 @@
+         // The three stages differ only in which original they forward to, so the substitution
+         // itself lives in one place.
+         typedef void(STDMETHODCALLTYPE *SetShaderResources_t)(ID3D11DeviceContext *, UINT, UINT, ID3D11ShaderResourceView *const *);
+-        static void bind_shader_resources(SetShaderResources_t original, ID3D11DeviceContext *context, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews);
++        static void bind_shader_resources(SetShaderResources_t original, ID3D11DeviceContext *context, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews, bool track_final_rgba_ps = false);
+         static HRESULT STDMETHODCALLTYPE Hooked_Map(ID3D11DeviceContext *context, ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE *pMappedResource);
+         static void STDMETHODCALLTYPE Hooked_Unmap(ID3D11DeviceContext *context, ID3D11Resource *pResource, UINT Subresource);
+ 
+
+--- a/src/D3D9Hook.cpp
++++ b/src/D3D9Hook.cpp
+@@ -1272,12 +1272,12 @@
+ 
+         struct Entry { const char *name; void *hook; void **orig; };
+         const Entry entries[] = {
+-            { "D3DXCreateTextureFromFileInMemoryEx", &Hooked_D3DXCreateTextureFromFileInMemoryEx, reinterpret_cast<void **>(&m_orig_d3dx_from_memory_ex) },
+-            { "D3DXCreateTextureFromFileInMemory",   &Hooked_D3DXCreateTextureFromFileInMemory,   reinterpret_cast<void **>(&m_orig_d3dx_from_memory) },
+-            { "D3DXCreateTextureFromFileExA",        &Hooked_D3DXCreateTextureFromFileExA,        reinterpret_cast<void **>(&m_orig_d3dx_from_file_ex_a) },
+-            { "D3DXCreateTextureFromFileExW",        &Hooked_D3DXCreateTextureFromFileExW,        reinterpret_cast<void **>(&m_orig_d3dx_from_file_ex_w) },
+-            { "D3DXCreateTextureFromFileA",          &Hooked_D3DXCreateTextureFromFileA,          reinterpret_cast<void **>(&m_orig_d3dx_from_file_a) },
+-            { "D3DXCreateTextureFromFileW",          &Hooked_D3DXCreateTextureFromFileW,          reinterpret_cast<void **>(&m_orig_d3dx_from_file_w) },
++            { "D3DXCreateTextureFromFileInMemoryEx", reinterpret_cast<void *>(&Hooked_D3DXCreateTextureFromFileInMemoryEx), reinterpret_cast<void **>(&m_orig_d3dx_from_memory_ex) },
++            { "D3DXCreateTextureFromFileInMemory",   reinterpret_cast<void *>(&Hooked_D3DXCreateTextureFromFileInMemory),   reinterpret_cast<void **>(&m_orig_d3dx_from_memory) },
++            { "D3DXCreateTextureFromFileExA",        reinterpret_cast<void *>(&Hooked_D3DXCreateTextureFromFileExA),        reinterpret_cast<void **>(&m_orig_d3dx_from_file_ex_a) },
++            { "D3DXCreateTextureFromFileExW",        reinterpret_cast<void *>(&Hooked_D3DXCreateTextureFromFileExW),        reinterpret_cast<void **>(&m_orig_d3dx_from_file_ex_w) },
++            { "D3DXCreateTextureFromFileA",          reinterpret_cast<void *>(&Hooked_D3DXCreateTextureFromFileA),          reinterpret_cast<void **>(&m_orig_d3dx_from_file_a) },
++            { "D3DXCreateTextureFromFileW",          reinterpret_cast<void *>(&Hooked_D3DXCreateTextureFromFileW),          reinterpret_cast<void **>(&m_orig_d3dx_from_file_w) },
+         };
+ 
+         int hooked = 0;
+
+--- a/src/HookManager.h
++++ b/src/HookManager.h
+@@ -31,6 +31,14 @@
+                 return false;
+             }
+             return true;
++        }
++
++        // Clang's GNU Windows target does not implement MSVC's implicit conversion from
++        // function pointers to void*. Keep upstream behavior with an explicit cast.
++        template <typename Target, typename Detour, typename Original>
++        bool prepare_hook(Target target, Detour detour, Original **original)
++        {
++            return prepare_hook(reinterpret_cast<void *>(target), reinterpret_cast<void *>(detour), original);
+         }
+ 
+         bool enable_hook(void *target)
+@@ -69,6 +77,12 @@
+             return true;
+         }
+ 
++        template <typename Target, typename Detour, typename Original>
++        bool create_hook(Target target, Detour detour, Original **original)
++        {
++            return create_hook(reinterpret_cast<void *>(target), reinterpret_cast<void *>(detour), original);
++        }
++
+     private:
+         HookManager() = default;
+         ~HookManager();
+
+--- a/src/IATHook.h
++++ b/src/IATHook.h
+@@ -10,8 +10,20 @@
+     public:
+         static bool hook_import(HMODULE module, const char *dll_name, const char *func_name, void *new_func, void **orig_func);
+ 
++        template <typename Function>
++        static bool hook_import(HMODULE module, const char *dll_name, const char *func_name, Function new_func, void **orig_func)
++        {
++            return hook_import(module, dll_name, func_name, reinterpret_cast<void *>(new_func), orig_func);
++        }
++
+         // hook_import on the game's executable. Other modules keep their own imports: the inline
+         // hook on the export itself is what reaches them.
+         static void hook_game_exe(const char *dll_name, const char *func_name, void *new_func, void **orig_func);
++
++        template <typename Function>
++        static void hook_game_exe(const char *dll_name, const char *func_name, Function new_func, void **orig_func)
++        {
++            hook_game_exe(dll_name, func_name, reinterpret_cast<void *>(new_func), orig_func);
++        }
+     };
+ }
+
+--- a/src/TextureManager.cpp
++++ b/src/TextureManager.cpp
+@@ -977,6 +977,8 @@
+                 p.second->Release();
+         }
+         m_d3d11_replacements.clear();
++        m_pending_d3d11_injections.clear();
++        m_failed_d3d11_injections.clear();
+ 
+         if (defer)
+             m_retire_after_frame = m_frame_count + 2;
+@@ -1533,6 +1535,17 @@
+         return true;
+     }
+ 
++    bool TextureManager::invalidate_final_rgba_resource11(ID3D11Resource *resource)
++    {
++        if (resource == nullptr)
++            return false;
++        const HRESULT hr = resource->SetPrivateData(TT_HASH_GUID, 0, nullptr);
++        // Invalidate cached SRV decisions even if a wrapper refuses private-data removal. The
++        // bind hook also checks the per-resource dirty marker before consulting any cache.
++        m_bind_generation.fetch_add(1, std::memory_order_relaxed);
++        return SUCCEEDED(hr);
++    }
++
+     void TextureManager::copy_tag9(IDirect3DBaseTexture9 *src, IDirect3DBaseTexture9 *dst)
+     {
+         if (src == nullptr || dst == nullptr)
+@@ -1610,10 +1623,26 @@
+ 
+     // Flags a drawn texture that has an inject file but no live replacement yet. Cheap: this runs
+     // inside the game's draw call, so it only records the hash. Caller MUST hold m_mutex.
+-    void TextureManager::note_pending_injection(uint64_t hash, bool is_dx11)
++    void TextureManager::note_pending_injection(uint64_t hash, bool is_dx11, uint32_t dx11_view_format)
+     {
+         if (!enable_injection)
+             return;
++        const D3D11ReplacementKey replacement_key{hash,
++            (dx11_view_format == DXGI_FORMAT_R16_UNORM || dx11_view_format == DXGI_FORMAT_R16_UINT)
++                ? dx11_view_format : 0u, 0u};
++        if (is_dx11)
++        {
++            if (m_failed_d3d11_injections.find(replacement_key) != m_failed_d3d11_injections.end())
++                return;
++            if (m_injected_files.find(hash) == m_injected_files.end())
++            {
++                auto t = m_tracked_textures.find(hash);
++                if (t == m_tracked_textures.end() || !has_inject_file(hash, t->second.sk_hash))
++                    return;
++            }
++            m_pending_d3d11_injections[replacement_key] = true;
++            return;
++        }
+         if (m_failed_injections.find(hash) != m_failed_injections.end())
+             return;
+         // Special K-named files too. Only our own naming was looked for, so after a Reload, or a
+@@ -1626,7 +1655,7 @@
+                 return;
+         }
+ 
+-        m_pending_injections[hash] = is_dx11;
++        m_pending_injections[hash] = false;
+     }
+ 
+     // Builds replacements flagged by note_pending_injection. Runs once per frame from on_frame,
+@@ -1650,17 +1679,14 @@
+             if (tit == m_tracked_textures.end())
+                 continue;
+ 
+-            const bool have = is_dx11
+-                ? m_d3d11_replacements.find(hash) != m_d3d11_replacements.end()
+-                : m_d3d9_replacements.find(hash) != m_d3d9_replacements.end();
++            const bool have = m_d3d9_replacements.find(hash) != m_d3d9_replacements.end();
+             if (have)
+                 continue;
+ 
+             // No device yet is a "not now", not a "never": leave the flag off and let the next
+             // draw re-raise it, instead of blacklisting a file that was never actually tried.
+-            ID3D11Device *dev11 = is_dx11 ? D3D11Hook::get().get_device() : nullptr;
+-            IDirect3DDevice9 *dev9 = is_dx11 ? nullptr : D3D9Hook::get().get_device();
+-            if (is_dx11 ? (dev11 == nullptr) : (dev9 == nullptr))
++            IDirect3DDevice9 *dev9 = D3D9Hook::get().get_device();
++            if (dev9 == nullptr)
+                 continue;
+ 
+             TextureDetails &details = tit->second;
+@@ -1670,12 +1696,33 @@
+             if (path.empty())
+                 continue; // the file went away with a rescan since it was flagged
+             details.injected_via_sk_name = via_sk_name;
+-            const bool ok = is_dx11
+-                ? build_replacement11(dev11, hash, path, details.mip_levels, details)
+-                : build_replacement9(dev9, hash, path, details.mip_levels, details);
++            const bool ok = build_replacement9(dev9, hash, path, details.mip_levels, details);
+ 
+             if (!ok)
+                 m_failed_injections.insert(hash); // do not retry a broken file every frame
++        }
++
++        while (!m_pending_d3d11_injections.empty() && budget-- > 0)
++        {
++            auto pit = m_pending_d3d11_injections.begin();
++            const D3D11ReplacementKey key = pit->first;
++            m_pending_d3d11_injections.erase(pit);
++            if (m_d3d11_replacements.find(key) != m_d3d11_replacements.end())
++                continue;
++            auto tit = m_tracked_textures.find(key.hash);
++            if (tit == m_tracked_textures.end())
++                continue;
++            ID3D11Device *dev11 = D3D11Hook::get().get_device();
++            if (dev11 == nullptr)
++                continue;
++            TextureDetails &details = tit->second;
++            bool via_sk_name = false;
++            const std::filesystem::path path = find_injection_path(key.hash, details.sk_hash, &via_sk_name);
++            if (path.empty())
++                continue;
++            details.injected_via_sk_name = via_sk_name;
++            if (!build_replacement11(dev11, key.hash, path, details.mip_levels, details, key.view_format, key.view_dimension))
++                m_failed_d3d11_injections.insert(key);
+         }
+     }
+ 
+@@ -2157,6 +2204,20 @@
+         if (orig_res == nullptr)
+             return orig;
+ 
++        uint32_t original_resource_format = DXGI_FORMAT_UNKNOWN;
++        uint32_t original_width = 0, original_height = 0, original_array_size = 0;
++        ID3D11Texture2D *orig_tex2d = nullptr;
++        if (SUCCEEDED(orig_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&orig_tex2d))) && orig_tex2d != nullptr)
++        {
++            D3D11_TEXTURE2D_DESC original_desc = {};
++            orig_tex2d->GetDesc(&original_desc);
++            original_resource_format = static_cast<uint32_t>(original_desc.Format);
++            original_width = original_desc.Width;
++            original_height = original_desc.Height;
++            original_array_size = original_desc.ArraySize;
++            orig_tex2d->Release();
++        }
++
+         // Resolve the content hash from the resource's private-data tag.
+         uint64_t hash = 0;
+         UINT size = sizeof(hash);
+@@ -2175,11 +2236,28 @@
+         D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
+         orig->GetDesc(&vd);
+ 
+-        // Our replacements are plain 2D views. If the game is sampling this content as an array,
+-        // cube, 3D or multisampled view, handing its shader a TEXTURE2D SRV would feed the wrong
+-        // resource type to the sampler: corrupt output or a dropped draw. Track it, but never
+-        // substitute.
+-        const bool replaceable_view = (vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D);
++        // Most replacements are plain 2D views. The wrapper's final RGBA page and its source
++        // R16 page are verified one-slice arrays; they need array SRVs to preserve shader type.
++        // Keep all other array/cube/3D/MS views fail-closed.
++        const bool r16_source = original_resource_format == DXGI_FORMAT_R16_TYPELESS ||
++            original_resource_format == DXGI_FORMAT_R16_UNORM || original_resource_format == DXGI_FORMAT_R16_UINT;
++        const bool r16_compatible_view = vd.Format == DXGI_FORMAT_R16_UNORM || vd.Format == DXGI_FORMAT_R16_UINT;
++        const bool r16_single_slice_array = r16_source && r16_compatible_view &&
++            vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY && original_array_size == 1 &&
++            vd.Texture2DArray.ArraySize == 1 && vd.Texture2DArray.FirstArraySlice == 0 &&
++            vd.Texture2DArray.MostDetailedMip == 0;
++        const bool r16_single_2d = r16_source && r16_compatible_view &&
++            vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && original_array_size == 1;
++        const bool rgba8_source = original_resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
++            original_resource_format == DXGI_FORMAT_R8G8B8A8_UNORM;
++        const bool rgba8_single_slice_array = rgba8_source && vd.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
++            vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY && original_array_size == 1 &&
++            vd.Texture2DArray.ArraySize == 1 && vd.Texture2DArray.FirstArraySlice == 0 &&
++            vd.Texture2DArray.MostDetailedMip == 0 && vd.Texture2DArray.MipLevels == 1;
++        const bool replaceable_view = (!r16_source && vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) ||
++            r16_single_2d || r16_single_slice_array || rgba8_single_slice_array;
++        const uint32_t replacement_view_dimension = (r16_single_slice_array || rgba8_single_slice_array)
++            ? static_cast<uint32_t>(D3D11_SRV_DIMENSION_TEXTURE2DARRAY) : 0u;
+ 
+         cache.tracked = 1;
+         cache.hash = hash;
+@@ -2200,6 +2278,7 @@
+ 
+         // Record how the game samples this texture (the SRV's concrete view format). Done
+         // once per texture; it reveals the sRGB intent that a TYPELESS resource hides.
++        bool logged_first_view = false;
+         {
+             auto tit = m_tracked_textures.find(hash);
+             if (tit != m_tracked_textures.end() && tit->second.view_format_id == 0 &&
+@@ -2207,8 +2286,18 @@
+             {
+                 tit->second.view_format_id = static_cast<uint32_t>(vd.Format);
+                 tit->second.view_format_str = dxgi_format_name(vd.Format);
+-            }
+-        }
++                logged_first_view = true;
++            }
++        }
++        if (logged_first_view)
++            Logger::get().info("[TextureManager] First SRV view for 0x" + format_hash_hex(hash) +
++                ": resource_format=" + std::to_string(original_resource_format) +
++                " view_format=" + std::to_string(static_cast<uint32_t>(vd.Format)) +
++                " view_dimension=" + std::to_string(static_cast<uint32_t>(vd.ViewDimension)) +
++                " resource_array_size=" + std::to_string(original_array_size) +
++                " view_first_slice=" + std::to_string(vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? vd.Texture2DArray.FirstArraySlice : 0u) +
++                " view_array_size=" + std::to_string(vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? vd.Texture2DArray.ArraySize : 1u) +
++                " dimensions=" + std::to_string(original_width) + "x" + std::to_string(original_height));
+ 
+         if (!replaceable_view)
+         {
+@@ -2245,16 +2334,57 @@
+         ID3D11ShaderResourceView *result = orig;
+         if (enable_injection && replaceable_view)
+         {
+-            auto it = m_d3d11_replacements.find(hash);
+-            if (it == m_d3d11_replacements.end())
+-            {
+-                // Hot reload: see the D3D9 path in get_replacement_texture9.
+-                note_pending_injection(hash, true);
+-            }
+-            else if (it->second != nullptr)
++            const uint32_t view_format_key = (vd.Format == DXGI_FORMAT_R16_UNORM || vd.Format == DXGI_FORMAT_R16_UINT || rgba8_single_slice_array)
++                ? static_cast<uint32_t>(vd.Format) : 0u;
++            const D3D11ReplacementKey key{hash, view_format_key, view_format_key != 0 ? replacement_view_dimension : 0u};
++            auto it = m_d3d11_replacements.find(key);
++            if (it != m_d3d11_replacements.end() && it->second != nullptr)
+             {
+                 cache.replacement = it->second;
+                 result = it->second;
++            }
++            else if (view_format_key != 0)
++            {
++                // Late-captured final RGBA pages and R16 textures can be bound after
++                // their only upload. Resolve the view type here and build the replacement
++                // once while we already own m_mutex.
++                // D3D11Hook's re-entry guard inside build_replacement11 prevents the
++                // replacement creation from recursing into the game's texture hooks.
++                auto tit = m_tracked_textures.find(hash);
++                if (tit != m_tracked_textures.end() &&
++                    m_failed_d3d11_injections.find(key) == m_failed_d3d11_injections.end())
++                {
++                    bool via_sk_name = false;
++                    const std::filesystem::path path = find_injection_path(hash, tit->second.sk_hash, &via_sk_name);
++                    if (!path.empty())
++                    {
++                        ID3D11Device *view_device = nullptr;
++                        orig->GetDevice(&view_device);
++                        if (view_device != nullptr)
++                        {
++                            tit->second.injected_via_sk_name = via_sk_name;
++                            if (!build_replacement11(view_device, hash, path, tit->second.mip_levels,
++                                                     tit->second, view_format_key, replacement_view_dimension))
++                            {
++                                m_failed_d3d11_injections.insert(key);
++                                tit->second.status = TextureStatus::FAILED;
++                            }
++                            view_device->Release();
++                        }
++                    }
++                    it = m_d3d11_replacements.find(key);
++                    if (it != m_d3d11_replacements.end() && it->second != nullptr)
++                    {
++                        cache.replacement = it->second;
++                        result = it->second;
++                    }
++                }
++                cache.generation = m_bind_generation.load(std::memory_order_relaxed);
++            }
++            else if (it == m_d3d11_replacements.end())
++            {
++                // Hot reload: see the D3D9 path in get_replacement_texture9.
++                note_pending_injection(hash, true, static_cast<uint32_t>(vd.Format));
+             }
+         }
+ 
+@@ -2264,14 +2394,15 @@
+         return result;
+     }
+ 
+-    void TextureManager::register_unmap_texture11(ID3D11Device *device, ID3D11Resource *resource, const void *pixel_data, UINT width, UINT height, DXGI_FORMAT format, UINT pitch,
+-                                                  const D3D11_SUBRESOURCE_DATA *initial_levels, UINT initial_level_count)
++    bool TextureManager::register_unmap_texture11(ID3D11Device *device, ID3D11Resource *resource, const void *pixel_data, UINT width, UINT height, DXGI_FORMAT format, UINT pitch,
++                                                  const D3D11_SUBRESOURCE_DATA *initial_levels, UINT initial_level_count,
++                                                  bool defer_replacement_until_view)
+     {
+         if (device == nullptr || resource == nullptr || pixel_data == nullptr || width == 0 || height == 0)
+-            return;
++            return false;
+ 
+         if (filter_small_textures && (width < 16 || height < 16))
+-            return;
++            return false;
+ 
+         reshade::api::format reshade_fmt = static_cast<reshade::api::format>(format);
+ 
+@@ -2281,7 +2412,7 @@
+         // GPU and break every shared texture mod. See TextureHash.h.
+         const UINT tight_row = reshade::api::format_row_pitch(reshade_fmt, width);
+         if (tight_row == 0)
+-            return;
++            return false;
+         const UINT rows = dxgi_format_is_compressed(format) ? ((height + 3) / 4) : height;
+ 
+         // Upload history first, so a streamed surface stops costing a pass over its pixels.
+@@ -2291,16 +2422,16 @@
+             SUCCEEDED(resource->GetPrivateData(TT_UPLOAD_STATS_GUID, &stats_size, &stats)) &&
+             stats_size == sizeof(stats);
+         if (have_stats && stats.streaming != 0)
+-            return;
++            return false;
+ 
+         uint64_t hash = compute_hash64_rows(static_cast<const uint8_t *>(pixel_data), pitch, tight_row, rows);
+         if (hash == 0)
+-            return;
++            return false;
+ 
+         note_upload_change(stats, have_stats, hash, width, height);
+         resource->SetPrivateData(TT_UPLOAD_STATS_GUID, sizeof(stats), &stats);
+         if (stats.streaming != 0)
+-            return;
++            return false;
+ 
+         // Only worth a second full pass over the pixels when an SK-named file could actually match.
+         const uint32_t sk_hash = (accept_sk_names && m_have_sk_files.load(std::memory_order_relaxed))
+@@ -2322,7 +2453,13 @@
+         std::lock_guard<std::mutex> lock(m_mutex);
+ 
+         // Tag the original resource with its content hash (see get_replacement_srv11).
+-        resource->SetPrivateData(TT_HASH_GUID, sizeof(hash), &hash);
++        if (FAILED(resource->SetPrivateData(TT_HASH_GUID, sizeof(hash), &hash)))
++            return false;
++        uint64_t verified_hash = 0;
++        UINT verified_size = sizeof(verified_hash);
++        if (FAILED(resource->GetPrivateData(TT_HASH_GUID, &verified_size, &verified_hash)) ||
++            verified_size != sizeof(verified_hash) || verified_hash != hash)
++            return false;
+ 
+         TextureDetails details;
+         details.hash = hash;
+@@ -2351,40 +2488,55 @@
+         // wrapper's (ReShade's, say) while a view it created reports the device underneath, and
+         // comparing those would rebuild the replacement on every upload.
+         {
+-            auto rit = m_d3d11_replacements.find(hash);
+-            if (rit != m_d3d11_replacements.end() && rit->second != nullptr)
+-            {
+-                ID3D11Device *owner = nullptr, *mine = nullptr;
++            ID3D11Device *mine = nullptr;
++            resource->GetDevice(&mine);
++            for (auto rit = m_d3d11_replacements.begin(); rit != m_d3d11_replacements.end();)
++            {
++                if (rit->first.hash != hash || rit->second == nullptr)
++                {
++                    ++rit;
++                    continue;
++                }
++                ID3D11Device *owner = nullptr;
+                 rit->second->GetDevice(&owner);
+-                resource->GetDevice(&mine);
+-                if (mine != nullptr)
+-                    mine->Release();
+-                if (owner != nullptr)
++                const bool different_device = owner != nullptr && mine != nullptr && owner != mine;
++                if (owner != nullptr) owner->Release();
++                if (different_device)
+                 {
+-                    owner->Release();
+-                    if (mine != nullptr && owner != mine)
+-                    {
+-                        m_bind_generation.fetch_add(1, std::memory_order_relaxed); // cached binds hold it
+-                        m_retired_replacements.push_back(rit->second);
+-                        m_retire_after_frame = m_frame_count + 2;
+-                        m_d3d11_replacements.erase(rit);
+-                    }
++                    m_bind_generation.fetch_add(1, std::memory_order_relaxed); // cached binds hold it
++                    m_retired_replacements.push_back(rit->second);
++                    m_retire_after_frame = m_frame_count + 2;
++                    rit = m_d3d11_replacements.erase(rit);
+                 }
+-            }
++                else
++                    ++rit;
++            }
++            if (mine != nullptr) mine->Release();
+         }
+ 
+         bool via_sk_name = false;
+         std::filesystem::path inject_path = find_injection_path(hash, sk_hash, &via_sk_name);
+         details.injected_via_sk_name = via_sk_name;
+         // See the Direct3D 9 path: a failure here is recorded, and not retried on every re-upload.
+-        if (enable_injection && !inject_path.empty() &&
+-            m_d3d11_replacements.find(hash) == m_d3d11_replacements.end() &&
+-            m_failed_injections.find(hash) == m_failed_injections.end())
+-        {
+-            if (!build_replacement11(device, hash, inject_path, original_levels, details))
+-                m_failed_injections.insert(hash);
+-        }
+-        else if (m_d3d11_replacements.find(hash) != m_d3d11_replacements.end())
++        const uint32_t view_key = (details.view_format_id == DXGI_FORMAT_R16_UNORM || details.view_format_id == DXGI_FORMAT_R16_UINT)
++            ? details.view_format_id : 0u;
++        const D3D11ReplacementKey replacement_key{hash, view_key, 0u};
++        if (enable_injection && !defer_replacement_until_view && !inject_path.empty() &&
++            m_d3d11_replacements.find(replacement_key) == m_d3d11_replacements.end() &&
++            m_failed_d3d11_injections.find(replacement_key) == m_failed_d3d11_injections.end())
++        {
++            if (!build_replacement11(device, hash, inject_path, original_levels, details, details.view_format_id))
++            {
++                // R16 SRV dimension is unknown until its first shader bind. Defer every
++                // R16 resource here; a remembered format alone cannot distinguish 2D from
++                // the game's verified single-slice array view.
++                const bool r16_source_unknown_view =
++                    format == DXGI_FORMAT_R16_TYPELESS || format == DXGI_FORMAT_R16_UNORM || format == DXGI_FORMAT_R16_UINT;
++                if (!r16_source_unknown_view)
++                    m_failed_d3d11_injections.insert(replacement_key);
++            }
++        }
++        else if (m_d3d11_replacements.find(replacement_key) != m_d3d11_replacements.end())
+         {
+             // See the Direct3D 9 path: the replacement survives a re-upload, and so must the
+             // record that reports it.
+@@ -2418,12 +2570,13 @@
+             if (m_tracked_textures[hash].status != TextureStatus::INJECTED)
+                 m_tracked_textures[hash].status = TextureStatus::DUMPED;
+         }
++        return true;
+     }
+ 
+     // Builds the DX11 replacement for one hash and stores it in m_d3d11_replacements.
+     // original_levels is the original texture's MipLevels (0 = runtime-generated full chain).
+     // Caller MUST hold m_mutex. Returns true when a replacement was created.
+-    bool TextureManager::build_replacement11(ID3D11Device *device, uint64_t hash, const std::filesystem::path &inject_path, UINT original_levels, TextureDetails &details)
++    bool TextureManager::build_replacement11(ID3D11Device *device, uint64_t hash, const std::filesystem::path &inject_path, UINT original_levels, TextureDetails &details, uint32_t original_view_format, uint32_t original_view_dimension)
+     {
+         if (device == nullptr)
+             return false;
+@@ -2456,15 +2609,48 @@
+                         Logger::get().warn("[TextureManager] Injected DDS 0x" + format_hash_hex(hash) + " has a single mip level, replacing a texture that had " + std::to_string(orig_effective_levels) + ". Mips cannot be generated from block-compressed data, so it samples level 0 at every distance and will shimmer in motion. Re-export with mipmaps if that was not intended.");
+                     }
+ 
+-                    // Use a concrete (non-TYPELESS) format so the SRV is valid.
+-                    DXGI_FORMAT view_fmt = dxgi_concrete_format(static_cast<DXGI_FORMAT>(dds.format));
++                    const DXGI_FORMAT dds_format = static_cast<DXGI_FORMAT>(dds.format);
++                    const bool r16_replacement = (dds_format == DXGI_FORMAT_R16_UNORM || dds_format == DXGI_FORMAT_R16_UINT);
++                    const bool r16_original_view = (original_view_format == DXGI_FORMAT_R16_UNORM || original_view_format == DXGI_FORMAT_R16_UINT);
++                    const bool r16_original_resource = (details.format_id == DXGI_FORMAT_R16_TYPELESS ||
++                        details.format_id == DXGI_FORMAT_R16_UNORM || details.format_id == DXGI_FORMAT_R16_UINT);
++                    const bool rgba8_single_array_replacement =
++                        original_view_dimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY &&
++                        original_view_format == DXGI_FORMAT_R8G8B8A8_UNORM &&
++                        (details.format_id == DXGI_FORMAT_R8G8B8A8_TYPELESS || details.format_id == DXGI_FORMAT_R8G8B8A8_UNORM) &&
++                        dds_format == DXGI_FORMAT_R8G8B8A8_UNORM;
++                    const bool r16_supported_view_dimension = original_view_dimension == 0u ||
++                        original_view_dimension == D3D11_SRV_DIMENSION_TEXTURE2D ||
++                        original_view_dimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
++                    if ((r16_replacement && (!r16_original_view || !r16_supported_view_dimension)) ||
++                        (r16_original_resource && !r16_replacement) ||
++                        (original_view_dimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY &&
++                         !r16_replacement && !rgba8_single_array_replacement))
++                    {
++                        Logger::get().warn("[TextureManager] Refusing R16 replacement for 0x" + format_hash_hex(hash) +
++                            ": DDS format " + std::to_string(static_cast<uint32_t>(dds_format)) +
++                            " is incompatible with original resource/view formats " +
++                            std::to_string(details.format_id) + "/" + std::to_string(original_view_format) + ".");
++                        return false;
++                    }
++
++                    // R16 DDS files carry a raw 16-bit word plane. Back them with a
++                    // TYPELESS texture and make a view with the original game's exact
++                    // R16_UNORM or R16_UINT view format, independent of the DDS's own
++                    // declaration. All other formats keep the upstream concrete path.
++                    DXGI_FORMAT texture_fmt = r16_replacement
++                        ? DXGI_FORMAT_R16_TYPELESS
++                        : dxgi_concrete_format(dds_format);
++                    DXGI_FORMAT view_fmt = r16_replacement
++                        ? static_cast<DXGI_FORMAT>(original_view_format)
++                        : texture_fmt;
+ 
+                     D3D11_TEXTURE2D_DESC desc = {};
+                     desc.Width = dds.width;
+                     desc.Height = dds.height;
+                     desc.MipLevels = static_cast<UINT>(mips.size());
+                     desc.ArraySize = 1;
+-                    desc.Format = view_fmt;
++                    desc.Format = texture_fmt;
+                     desc.SampleDesc.Count = 1;
+                     desc.SampleDesc.Quality = 0;
+                     desc.Usage = D3D11_USAGE_DEFAULT;
+@@ -2487,10 +2673,22 @@
+                     {
+                         ID3D11ShaderResourceView *highres_srv = nullptr;
+                         D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+-                        srv_desc.Format = desc.Format;
+-                        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+-                        srv_desc.Texture2D.MostDetailedMip = 0;
+-                        srv_desc.Texture2D.MipLevels = desc.MipLevels;
++                        srv_desc.Format = view_fmt;
++                        if ((r16_replacement || rgba8_single_array_replacement) &&
++                            original_view_dimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY)
++                        {
++                            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
++                            srv_desc.Texture2DArray.MostDetailedMip = 0;
++                            srv_desc.Texture2DArray.MipLevels = desc.MipLevels;
++                            srv_desc.Texture2DArray.FirstArraySlice = 0;
++                            srv_desc.Texture2DArray.ArraySize = 1;
++                        }
++                        else
++                        {
++                            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++                            srv_desc.Texture2D.MostDetailedMip = 0;
++                            srv_desc.Texture2D.MipLevels = desc.MipLevels;
++                        }
+ 
+                         hr = device->CreateShaderResourceView(highres_tex, &srv_desc, &highres_srv);
+                         highres_tex->Release(); // SRV holds the texture reference
+@@ -2498,7 +2696,11 @@
+                         if (SUCCEEDED(hr) && highres_srv != nullptr)
+                         {
+                             // Keep our reference (released in release_replacements).
+-                            m_d3d11_replacements[hash] = highres_srv;
++                            const bool specialized_array_or_r16 = r16_replacement || rgba8_single_array_replacement;
++                            const D3D11ReplacementKey replacement_key{hash,
++                                specialized_array_or_r16 ? original_view_format : 0u,
++                                specialized_array_or_r16 ? original_view_dimension : 0u};
++                            m_d3d11_replacements[replacement_key] = highres_srv;
+                             m_bind_generation.fetch_add(1, std::memory_order_relaxed);
+ 
+                             details.status = TextureStatus::INJECTED;
+@@ -2508,7 +2710,8 @@
+                             details.repl_height = dds.height;
+                             created = true;
+ 
+-                            Logger::get().info("[TextureManager] Loaded DX11 replacement for 0x" + format_hash_hex(hash) + " (" + std::to_string(dds.width) + "x" + std::to_string(dds.height) + ", " + std::to_string(mips.size()) + " mips, original had " + std::to_string(original_levels) + ")");
++                            Logger::get().info("[TextureManager] Loaded DX11 replacement for 0x" + format_hash_hex(hash) + " (" + std::to_string(dds.width) + "x" + std::to_string(dds.height) + ", " + std::to_string(mips.size()) + " mips, original had " + std::to_string(original_levels) +
++                                (r16_replacement ? ", typeless R16 backing, original view " + std::to_string(original_view_format) : std::string()) + ")");
+                         }
+                     }
+                     else
+@@ -2559,8 +2762,25 @@
+             if (pair.second.replacement_handle != 0)
+                 pair.second.status = TextureStatus::INJECTED;
+             else if (has_inject_file(pair.first, pair.second.sk_hash))
+-                pair.second.status = (m_failed_injections.find(pair.first) != m_failed_injections.end())
+-                    ? TextureStatus::FAILED : TextureStatus::PENDING;
++            {
++                const uint32_t view_key = (pair.second.view_format_id == DXGI_FORMAT_R16_UNORM || pair.second.view_format_id == DXGI_FORMAT_R16_UINT)
++                    ? pair.second.view_format_id : 0u;
++                bool failed = false;
++                if (pair.second.is_dx11)
++                {
++                    for (const auto &failed_key : m_failed_d3d11_injections)
++                    {
++                        if (failed_key.hash == pair.first && failed_key.view_format == view_key)
++                        {
++                            failed = true;
++                            break;
++                        }
++                    }
++                }
++                else
++                    failed = m_failed_injections.find(pair.first) != m_failed_injections.end();
++                pair.second.status = failed ? TextureStatus::FAILED : TextureStatus::PENDING;
++            }
+ 
+             if (hidden_as_small(pair.second))
+                 continue;
+@@ -2586,7 +2806,7 @@
+         // read as "0 found".
+         st.files_found = m_injected_files.size() + m_sk_injected_files.size();
+         st.applied = m_d3d9_replacements.size() + m_d3d11_replacements.size();
+-        st.failed = m_failed_injections.size();
++        st.failed = m_failed_injections.size() + m_failed_d3d11_injections.size();
+         return st;
+     }
+ 
+
+--- a/src/TextureManager.h
++++ b/src/TextureManager.h
+@@ -7,6 +7,7 @@
+ #include <vector>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <utility>
+ #include <mutex>
+ #include <filesystem>
+ #include <atomic>
+@@ -193,6 +194,10 @@
+         // so without this every texture such a game uploads is tracked and never seen in a scene.
+         // Returns whether the source carried a tag (for the copy diagnostics).
+         bool copy_tag11(ID3D11Resource *src, ID3D11Resource *dst);
++        // A FinalRGBA page that is written after its diagnostic snapshot becomes fail-closed for
++        // this run. Remove only that resource's content tag and invalidate cached SRV decisions;
++        // content-hash replacement entries remain available to other unchanged resources.
++        bool invalidate_final_rgba_resource11(ID3D11Resource *resource);
+         void log_untracked_bind11(ID3D11Resource *res);
+ 
+         // The content hash tagged onto a resource, or 0 if it carries none. Lets the hook layer
+@@ -202,13 +207,34 @@
+         // Virtual Replacements for DX11
+         ID3D11ShaderResourceView *get_replacement_srv11(ID3D11ShaderResourceView *orig);
+     private:
++        struct D3D11ReplacementKey
++        {
++            uint64_t hash = 0;
++            uint32_t view_format = 0; // nonzero only for R16_UNORM/R16_UINT compatibility views
++            uint32_t view_dimension = 0; // nonzero only for supported single-slice R16 array views
++            bool operator==(const D3D11ReplacementKey &other) const noexcept
++            {
++                return hash == other.hash && view_format == other.view_format && view_dimension == other.view_dimension;
++            }
++        };
++        struct D3D11ReplacementKeyHash
++        {
++            size_t operator()(const D3D11ReplacementKey &key) const noexcept
++            {
++                const size_t h = std::hash<uint64_t>{}(key.hash);
++                const size_t f = h ^ (std::hash<uint32_t>{}(key.view_format) + 0x9e3779b9u + (h << 6) + (h >> 2));
++                return f ^ (std::hash<uint32_t>{}(key.view_dimension) + 0x9e3779b9u + (f << 6) + (f >> 2));
++            }
++        };
++
+         ID3D11ShaderResourceView *resolve_srv11_slow(ID3D11ShaderResourceView *orig, uint32_t generation, uint64_t frame);
+     public:
+         // initial_levels/initial_level_count are the CreateTexture2D initial-data array when the
+         // game supplied one. That is the only moment the whole mip chain is visible at once, so it
+         // is the only path where auto-dump can capture more than the top level.
+-        void register_unmap_texture11(ID3D11Device *device, ID3D11Resource *resource, const void *pixel_data, UINT width, UINT height, DXGI_FORMAT format, UINT pitch,
+-                                      const D3D11_SUBRESOURCE_DATA *initial_levels = nullptr, UINT initial_level_count = 0);
++        bool register_unmap_texture11(ID3D11Device *device, ID3D11Resource *resource, const void *pixel_data, UINT width, UINT height, DXGI_FORMAT format, UINT pitch,
++                                      const D3D11_SUBRESOURCE_DATA *initial_levels = nullptr, UINT initial_level_count = 0,
++                                      bool defer_replacement_until_view = false);
+ 
+         // Dumps a texture to TT/dump immediately (synchronously, on the calling thread) and
+         // returns true on success. Reads back the live GPU resource: the pinned preview
+@@ -296,7 +322,7 @@
+         // reused pointer can never inherit a stale replacement.
+         // We own exactly one COM reference for each stored replacement.
+         std::unordered_map<uint64_t, IDirect3DBaseTexture9 *> m_d3d9_replacements;
+-        std::unordered_map<uint64_t, ID3D11ShaderResourceView *> m_d3d11_replacements;
++        std::unordered_map<D3D11ReplacementKey, ID3D11ShaderResourceView *, D3D11ReplacementKeyHash> m_d3d11_replacements;
+ 
+         // `defer` moves the COM references onto m_retired_replacements instead of releasing them
+         // straight away. The bind fast path reads a cached replacement pointer without the lock, so
+@@ -311,20 +337,22 @@
+         // also be built later, when a DDS is added while the game is running (the texture is never
+         // re-uploaded, so hot reload has to build it after the fact). Both require m_mutex.
+         bool build_replacement9(IDirect3DDevice9 *device, uint64_t hash, const std::filesystem::path &inject_path, UINT original_levels, TextureDetails &details);
+-        bool build_replacement11(ID3D11Device *device, uint64_t hash, const std::filesystem::path &inject_path, UINT original_levels, TextureDetails &details);
++        bool build_replacement11(ID3D11Device *device, uint64_t hash, const std::filesystem::path &inject_path, UINT original_levels, TextureDetails &details, uint32_t original_view_format = 0, uint32_t original_view_dimension = 0);
+ 
+         // Hot reload. The bind hooks only FLAG a hash (note_pending_injection, cheap, runs inside
+         // the game's draw call); the actual DDS read and texture creation happen in on_frame via
+         // process_pending_injections, a couple per frame. Both require m_mutex.
+-        void note_pending_injection(uint64_t hash, bool is_dx11);
++        void note_pending_injection(uint64_t hash, bool is_dx11, uint32_t dx11_view_format = 0);
+         bool has_inject_file(uint64_t hash, uint32_t sk_hash) const;
+         void process_pending_injections();
+ 
+         std::unordered_map<uint64_t, bool> m_pending_injections; // hash -> is_dx11
++        std::unordered_map<D3D11ReplacementKey, bool, D3D11ReplacementKeyHash> m_pending_d3d11_injections;
+ 
+         // Hashes whose inject file failed to load/create, so we do not retry a broken file every
+         // frame. Cleared by rescan_injected.
+         std::unordered_set<uint64_t> m_failed_injections;
++        std::unordered_set<D3D11ReplacementKey, D3D11ReplacementKeyHash> m_failed_d3d11_injections;
+ 
+         // Live original-texture preview (see set_preview_target). We hold one COM reference.
+         uint64_t m_preview_target_hash = 0;
+

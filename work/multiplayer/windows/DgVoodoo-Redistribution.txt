@@ -1,0 +1,8 @@
+dgVoodoo2 redistribution notice
+
+This setup includes unmodified 32-bit DDraw.dll and D3DImm.dll from dgVoodoo2 version 2.79.3, distributed alongside the Hogs of War graphics profile under the dgVoodoo2 redistribution terms.
+
+Project and terms: https://dege.fw.hu/dgVoodoo2/ReadmeGeneral/
+Official project page: https://dege.fw.hu/dgVoodoo2/
+
+The DLLs are unmodified. The setup does not include DXVK, MoltenVK, the dgVoodoo control panel, or other dgVoodoo components.

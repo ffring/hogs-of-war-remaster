@@ -1,0 +1,30 @@
+{
+  "version": "0.5.0-test",
+  "mac_profile": {
+    "loaded_hd_pages_in_actual_owner_game": 24,
+    "new_installer_static_hash_and_signature_checks": "passed",
+    "new_installer_full_game_acceptance": false
+  },
+  "windows_profile": {
+    "embedded_payload_checks": "passed",
+    "isolated_wine_transaction_checks": 12,
+    "isolated_wine_transaction_result": "passed",
+    "real_windows_tested": false
+  },
+  "mouse_candidate": {
+    "control_and_ABI_mock_groups": 10,
+    "result": "passed",
+    "release_load_smoke": "passed",
+    "native_to_wine_read_only_focus_mapping_phases": 8,
+    "native_publisher_and_launcher_fixture": "passed",
+    "physical_mouse_in_game_tested": false,
+    "included_in_0_5_installers": false
+  },
+  "network": {
+    "directplay_exchange_on_same_mac_loopback": "passed",
+    "directplay_exchange_on_same_mac_explicit_lan_ip": "passed",
+    "two_computer_match_tested": false,
+    "tailscale_connection_tested": false
+  },
+  "game_executable_or_full_archives_bundled": false
+}
