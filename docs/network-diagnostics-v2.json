@@ -1,0 +1,13 @@
+{
+  "probe_version": 2,
+  "asset": "Hogs-of-War-Network-Diagnostics-v2-20261104.zip",
+  "asset_sha256": "7b164fa4ba547bff0f8bc2c6fbae02d68b33e82772a7555b231ddfff198ead44",
+  "probe_sha256": "83e519e9c2fe78bfd65f29ce45680b15776d1c4217337ccbdd49a90ba7f4fb69",
+  "source_sha256": "59c89723be85873e0fe169fbf224792e896815177e2d335902d02bc51f195b67",
+  "whole_process_timeout": true,
+  "timeout_callback_repeats_wait": false,
+  "wire_protocol_changed": false,
+  "game_launched_for_checks": false,
+  "isolated_callback_watchdog_and_argument_checks": "5passed",
+  "actual_two_computer_peer_exchange": false
+}
