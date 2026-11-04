@@ -1,0 +1,11 @@
+{
+  "asset": "Hogs-of-War-Network-Diagnostics-20261104.zip",
+  "asset_sha256": "314e92cb20936964bd6357521386a2fffafb00f4f70d144ebb16e12a40a7cfe5",
+  "probe_sha256": "92b5b4e081f4c4e7aa1429bb1a2622c4c35a995a17e6134559c65e7b2574e928",
+  "source_sha256": "0b06ee61f45b75abf4db912859251a293f332eaa12355adde98d6b5429587024",
+  "source": "src/network/dplay-probe.c",
+  "contains_game": false,
+  "contains_logs_or_account_data": false,
+  "previous_test": "bidirectional DirectPlay exchange between two processes on one Mac",
+  "two_computer_acceptance": false
+}
