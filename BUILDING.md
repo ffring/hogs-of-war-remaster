@@ -36,7 +36,7 @@ bash experiments/native-menu/native-ini-v1/tests/build.sh
 
 The first script runs portable policy checks and writes `experiments/native-menu/build/HogsMouse-native-menu.asi` plus console fixtures. It does not launch Wine or the game. Run the Windows console fixtures only on Windows or in a separate isolated Wine prefix. [Validation and limitations](experiments/native-menu/VALIDATION.json) distinguish these checks from actual game acceptance.
 
-The current release ASI hash is `225d7a31ea82fa5b4f88139709194a940252598739dbf272b80207de48afd19d`. It includes native body turning, ordinary weapon aiming and in-game Options → Mouse settings. Local enhancements are disabled in active or unknown network sessions; native synchronized input remains in use there. The 0.5 installers do not include this module.
+The current owner-installed ASI hash is `225d7a31ea82fa5b4f88139709194a940252598739dbf272b80207de48afd19d`. It includes native body turning, ordinary weapon aiming and in-game Options → Mouse settings. Local enhancements are disabled in active or unknown network sessions; native synchronized input remains in use there. The 0.5 installers do not include this module.
 
 On macOS it also requires the focus publisher and matching launcher wiring described in `src/native/README.md`; copying only the ASI is insufficient for the complete Mac focus protection. `src/mouse`, `tests/mouse` and `experiments/native-body` retain historical revisions for research; they are not the current module.
 
