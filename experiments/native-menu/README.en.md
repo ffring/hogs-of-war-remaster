@@ -1,15 +1,13 @@
-# Staged native mouse/menu build
+# Native mouse controls and in-game settings, v2
 
-This is an isolated PE32 candidate built from the current HogsMouse input source plus the native Options-menu bridge, runtime, and DirectDraw renderer. It does not include game executables or game data.
+Owner-local target: the pinned November 2000 Steam PE32 with the current Russian localization. No game executable or full game archive is included.
 
-The linear mode-14 aim detour is guarded by `Mouse/LinearAimEnable=0` and is off in the supplied INI. If explicitly enabled, it applies only to the verified mode-14 / weapon-7 path; other aim paths retain the existing digital handling. Its input packet uses a process-local token not decoded by remote peers, so this candidate is **not** multiplayer-compatible when linear aim is enabled and must stay out of friend/network installers.
+The local body-yaw hook changes only the argument of the existing native pig turn command at 492D9A; its original method and return address remain intact. At NativeUnitsPerPixel=12 the effective range is three times the original gain-4 baseline, including the previous peak-speed limit (30 to 90 units). Fractional low-gain input is carried without idle motion or reversal backlog. Ordinary aiming in camera modes14/17 uses native yaw and pitch commands; weapon IDs11/64 retain their original scope/zoom handling.
 
-## Build and checks
+LinearAimEnable=1 enables these changes only when the verified DirectPlay session byte at manager+4AD is clear. Online, missing-manager and unreadable-state cases retain native synchronized input. A 16-entry process-local token queue matches actor, human user, pig, camera, weapon, mode, wire axes and route; each sample is used once and expires after100ms. Joystick ownership, keyboard directions, focus loss and session transitions invalidate conflicting local samples.
 
-Run `bash build.sh` with Zig 0.14.1 on PATH (or set `ZIG` to its executable path). It compiles the release ASI and two PE32 fixtures. The script runs host-side aim, patch-policy, menu-policy, runtime-policy, and native-input-policy tests. The PE32 fixtures are compiled only; they are intended for the integration owner's isolated test prefix, never the live game.
+The original Options screen receives a fourth Mouse item and a native bitmap-font settings pane. Turn/aim sensitivity and both inversion axes are saved transactionally, then applied after mouse-button release. Original Audio, Controls and Credits actions remain native. The conditional mission wait requires release before a fresh keypress. Bounded events record menu open/save/cancel and wait enter/accept/leave in HogsMouse.log.
 
-The parent integration owner subsequently ran the PE32 axis/input fixtures and release-DLL load probe in an isolated Wine prefix; all passed. Native Options callbacks and save/cancel/error handling passed a separate Win32 fixture. Actual game visibility and physical acceptance remain unverified. No installed game or app file was changed.
+The source and release were tested with synthetic game memory, actual retail instruction emulation and isolated Wine console fixtures. The physical game was not launched for this upgrade. In-game visual acceptance and an actual two-computer network match remain unverified.
 
-This prototype targets the existing Russian localization and its custom bitmap-font alphabet. It is not a universal-language release. Original Options labels are fetched from FE17 and FE21–23, while the added labels use that Russian atlas. The Options screen itself is drawn through native glyphs so a fourth row does not depend on unverified legacy row caches.
-
-The menu exposes the actual tuning keys. With linear aim disabled, increasing gain still reaches the original peak-speed limits. Do not claim that the menu alone fixes the owner’s sensitivity complaint. The pre-mission release-before-press guard applies only when the game enters its existing conditional wait phase; it does not force every mission to wait.
+Build with Zig0.14.1 using bash build.sh. Set ZIG to its executable path if needed. The ASI is built without HOGSMOUSE_TEST; all fake-world and ABI test seams are absent from the release.

@@ -16,6 +16,7 @@
 
 typedef void (HNR_CDECL *HnrSetWaitFn)(int active);
 typedef void (HNR_CDECL *HnrClearInputFn)(void);
+typedef void (HNR_CDECL *HnrLogFn)(const char *event);
 
 /* Call from the game thread after the settings path and host callbacks exist.
    The supplied path must be an absolute path to this installation's INI. */
@@ -24,6 +25,7 @@ int HNR_CDECL hmn_runtime_init(const char *ini_path,
                                HnrClearInputFn clear_input);
 /* Returns zero if owned row pointers cannot be restored safely; keep module loaded. */
 int HNR_CDECL hmn_runtime_shutdown(void);
+void HNR_CDECL hmn_runtime_set_logger(HnrLogFn logger);
 int HNR_CDECL hmn_runtime_ui_active(void);
 const HMMenuState *HNR_CDECL hmn_runtime_menu_state(void);
 

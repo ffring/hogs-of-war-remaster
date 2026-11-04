@@ -21,6 +21,12 @@ mkdir -p "$OUT"
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror -I "$HERE/helpers" \
   "$HERE/tests/native_input_policy_test.c" -o "$OUT/native_input_policy_test"
 "$OUT/native_input_policy_test"
+"$CC" -std=c11 -O2 -Wall -Wextra -Werror \
+  "$HERE/tests/body_yaw_policy_test.c" -o "$OUT/body_yaw_policy_test"
+"$OUT/body_yaw_policy_test"
+"$CC" -std=c11 -O2 -Wall -Wextra -Werror \
+  "$HERE/tests/mouse_tokens_test.c" -o "$OUT/mouse_tokens_test"
+"$OUT/mouse_tokens_test"
 
 COMMON=(-target x86-windows-gnu -fms-extensions -fasm-blocks -std=c11 -O2 -Wall -Wextra -Werror -Wno-unused-function)
 INCLUDES=("-I$HERE" "-I$HERE/helpers" "-I$HERE/native-menu-v1" "-I$HERE/native-menu-policy-v1" "-I$HERE/native-runtime-v1" "-I$HERE/native-render-v1" "-I$HERE/native-ini-v1" "-I$HERE/loading-prompt-v1")
@@ -40,6 +46,13 @@ INCLUDES=("-I$HERE" "-I$HERE/helpers" "-I$HERE/native-menu-v1" "-I$HERE/native-m
   -o "$OUT/native_axis_bridge_harness.exe" \
   "$HERE/tests/native_axis_bridge_harness.c" -lkernel32
 
+# Native body-bridge ABI fixture. Compile only; the parent owns any isolated
+# Wine execution after source and payload pins have been reviewed.
+# shellcheck disable=SC2086
+"$ZIG" cc "${COMMON[@]}" "${INCLUDES[@]}" -Wl,--image-base,0x10000000 \
+  -o "$OUT/native_body_bridge_harness.exe" \
+  "$HERE/tests/native_body_bridge_harness.c" -lkernel32
+
 # Input CUI fixture uses the same HogsMouse.c compiled with test-only seams.
 # It is PE32 and intended for an isolated prefix only, never the game process.
 # shellcheck disable=SC2086
@@ -48,4 +61,5 @@ INCLUDES=("-I$HERE" "-I$HERE/helpers" "-I$HERE/native-menu-v1" "-I$HERE/native-m
   "$HERE/HogsMouse.c" "$HERE/tests/native_input_harness.c" -luser32 -lkernel32
 
 shasum -a 256 "$OUT/HogsMouse-native-menu.asi" \
-  "$OUT/native_axis_bridge_harness.exe" "$OUT/native_input_harness.exe"
+  "$OUT/native_axis_bridge_harness.exe" "$OUT/native_body_bridge_harness.exe" \
+  "$OUT/native_input_harness.exe"

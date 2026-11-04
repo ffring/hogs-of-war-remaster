@@ -4,7 +4,13 @@
 #include <stdint.h>
 #include "linear_aim_policy.h"
 
-enum { HML_MODE_AIM = 14, HML_WEAPON_SUPPORTED = 7 };
+enum {
+    HML_MODE_AIM = 14,
+    HML_MODE_AIM_ALT = 17,
+    HML_WEAPON_MAX_VERIFIED = 80,
+    HML_WEAPON_ZOOM_SPECIAL = 11,
+    HML_WEAPON_ALT_CAMERA_SPECIAL = 64
+};
 enum { HML_DIR_MASK = 0x0Fu, HML_CONTROLLER_HUMAN = 0, HML_CONTROLLER_QUEUE = 1 };
 enum { HML_NOT_INTERCEPTED = 0, HML_AIM_APPLIED = 1, HML_ORIGINAL_ONLY = 2 };
 
@@ -20,12 +26,21 @@ typedef struct {
     int32_t original_result;
 } HMLCall;
 
+static inline int hml_mode_supported(int mode) {
+    return mode==HML_MODE_AIM || mode==HML_MODE_AIM_ALT;
+}
+
+static inline int hml_weapon_supported(int weapon) {
+    return weapon>=1 && weapon<=HML_WEAPON_MAX_VERIFIED &&
+        weapon!=HML_WEAPON_ZOOM_SPECIAL && weapon!=HML_WEAPON_ALT_CAMERA_SPECIAL;
+}
+
 /* The callback must check the exact active-human actor/camera/pig identity,
    foreground/focus/UI gates, and pig vtable+0x20 == retail 0x0046AF30. */
 static inline int hml_dispatch(HMLCall *call, HMLAxisPacket packet) {
     if (!call || !call->axes_word || !call->button_mask || !call->original_handler ||
         !call->context_unchanged || !call->pitch_delta || !call->yaw_delta ||
-        call->mode != HML_MODE_AIM || call->weapon != HML_WEAPON_SUPPORTED ||
+        !hml_mode_supported(call->mode) || !hml_weapon_supported(call->weapon) ||
         (call->controller_kind != HML_CONTROLLER_HUMAN &&
          call->controller_kind != HML_CONTROLLER_QUEUE) ||
         (*call->button_mask & HML_DIR_MASK) != 0 || !call->context_unchanged(call->opaque))

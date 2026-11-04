@@ -12,7 +12,8 @@ enum { GLOBAL_MAP_BASE = 0x20000000u, GLOBAL_SIZE = 0x7000u,
        TABLE_BASE = 0x21000000u, TABLE_SIZE = 0x3000u,
        NODE_STRIDE_TEST = 0x48u, NODE_COUNT_TEST = 52u };
 
-static unsigned failures, draws, options_draws, wait_transitions, input_clears;
+static unsigned failures, draws, options_draws, wait_transitions, input_clears, event_logs;
+static void HNR_CDECL test_logger(const char *event) { if (event && *event) ++event_logs; }
 static int ready = 1, draw_ok = 1, options_draw_ok = 1;
 static int host_wait_active, draw_error, options_selection = -1;
 static uint8_t *node_root;
@@ -185,6 +186,7 @@ static void test_wait_wrong_context_and_shutdown(void) {
     CHECK(hmn_action(HMN_ACTION_BACK) == 0, "actions on another native node pass through");
     put32((uint8_t *)(uintptr_t)HNR_CURRENT_NODE_GLOBAL, 0, (uint32_t)(uintptr_t)options_node());
     select_row(3);
+    CHECK(event_logs>=5,"bounded menu and wait events logged");
     CHECK(hmn_runtime_shutdown(), "runtime shutdown restores its row safely");
     CHECK(get32(options_node(), 0) == 3 &&
           get32(options_node(), 0x18) == HNR_ORIGINAL_ACTION_TABLE &&
@@ -211,6 +213,7 @@ int main(void) {
         }
     }
     if (!hmn_runtime_init(ini_path, test_set_wait, test_clear_input)) return 12;
+    hmn_runtime_set_logger(test_logger);
     test_row_and_label();
     test_open_cancel_save();
     test_read_error_and_draw_failure();

@@ -19,6 +19,8 @@ typedef struct HnrRuntime {
     char ini_path[MAX_PATH];
     HnrSetWaitFn set_wait_active;
     HnrClearInputFn clear_input;
+    HnrLogFn logger;
+    int wait_accepted;
     HogsMouseSettings settings;
     HMMenuState menu;
     HogsWaitInputPolicy wait_policy;
@@ -37,6 +39,7 @@ typedef struct HnrRuntime {
 } HnrRuntime;
 
 static HnrRuntime g_runtime;
+static void hnr_log(const char *event) { if (g_runtime.logger) g_runtime.logger(event); }
 static uint32_t g_action_rows[HNR_OPTIONS_EXTENDED_COUNT];
 static uint32_t g_target_rows[HNR_OPTIONS_EXTENDED_COUNT];
 /* Text lookup returns the encoded FE byte stream (ASCII glyph minus 0x1f). */
@@ -162,6 +165,7 @@ static int hnr_install_options_row(void) {
         goto fail_closed;
     }
     g_runtime.row_installed = 1;
+    hnr_log("NativeOptions Mouse row installed.");
     return 1;
 
 fail_closed:
@@ -223,6 +227,7 @@ static int hnr_open_menu(void) {
                       g_runtime.settings.aim_sensitivity_percent,
                       g_runtime.settings.invert_x, g_runtime.settings.invert_y)) return 0;
     hnr_sync_host_state();
+    hnr_log("NativeMouse settings opened.");
     return 1;
 }
 
@@ -246,6 +251,7 @@ static void hnr_finish_save(void) {
         g_runtime.menu.status = HM_MENU_STATUS_EDITING;
         return;
     }
+    hnr_log("NativeMouse settings saved.");
     g_runtime.settings = next;
     g_runtime.can_save = 0;
     g_runtime.error = HNR_ERROR_NONE;
@@ -300,6 +306,8 @@ int HNR_CDECL hmn_runtime_shutdown(void) {
     return 1;
 }
 
+void HNR_CDECL hmn_runtime_set_logger(HnrLogFn logger) { g_runtime.logger=logger; }
+
 int HNR_CDECL hmn_runtime_ui_active(void) {
     return g_runtime.menu.active != 0;
 }
@@ -331,6 +339,7 @@ int HNR_CDECL hmn_action(int action) {
     }
     result = hm_menu_action(&g_runtime.menu, 1, policy_action);
     if (result == HM_MENU_RESULT_CANCEL_REQUEST) {
+        hnr_log("NativeMouse settings canceled.");
         g_runtime.error = HNR_ERROR_NONE;
         hnr_sync_host_state();
     } else if (result == HM_MENU_RESULT_SAVE_REQUEST) {
@@ -369,19 +378,26 @@ void HNR_CDECL hmn_before_sprite_batch(void) {
 
 void HNR_CDECL hmn_wait_enter(void) {
     if (!g_runtime.initialized) return;
+    g_runtime.wait_accepted=0;
+    hnr_log("NativeWait entered; waiting for release then fresh press.");
     hogs_wait_policy_enter(&g_runtime.wait_policy);
     hnr_sync_host_state();
 }
 
 void HNR_CDECL hmn_wait_leave(void) {
     if (!g_runtime.initialized) return;
+    hnr_log("NativeWait left.");
     hogs_wait_policy_leave(&g_runtime.wait_policy);
     hnr_sync_host_state();
 }
 
 int HNR_CDECL hmn_wait_input(int native_input) {
     if (!g_runtime.initialized) return native_input == 1;
-    return hogs_wait_policy_filter(&g_runtime.wait_policy, native_input);
+    int result=hogs_wait_policy_filter(&g_runtime.wait_policy,native_input);
+    if (g_runtime.wait_policy.active && result && !g_runtime.wait_accepted) {
+        g_runtime.wait_accepted=1;hnr_log("NativeWait accepted fresh press.");
+    }
+    return result;
 }
 
 const char *HNR_CDECL hmn_text_override(void *font, int text_id) {

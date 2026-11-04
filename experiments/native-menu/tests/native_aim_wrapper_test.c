@@ -63,6 +63,26 @@ int main(void) {
     c=make_call(&f,14,7,2);
     assert(hml_dispatch(&c,packet)==HML_NOT_INTERCEPTED&&f.original_calls==0);
 
+    /* Every ordinary weapon in the two retail modes shares the validated
+       linear sinks; only the two dedicated camera/zoom IDs are refused. */
+    for (int mode=14;mode<=17;mode+=3) {
+        for (int weapon=1;weapon<=80;++weapon) {
+            f=(Fixture){0xa5c3f406u,0,1,0,0,0,0,0,0,0,0};
+            c=make_call(&f,mode,weapon,HML_CONTROLLER_HUMAN);
+            int result=hml_dispatch(&c,packet);
+            if (weapon==11 || weapon==64)
+                assert(result==HML_NOT_INTERCEPTED&&f.original_calls==0);
+            else
+                assert(result==HML_AIM_APPLIED&&f.original_calls==1&&
+                       f.pitch_calls==1&&f.yaw_calls==1);
+        }
+    }
+    f=(Fixture){0xa5c3f406u,0,1,0,0,0,0,0,0,0,0};
+    c=make_call(&f,14,0,HML_CONTROLLER_HUMAN);
+    assert(hml_dispatch(&c,packet)==HML_NOT_INTERCEPTED);
+    c=make_call(&f,17,81,HML_CONTROLLER_HUMAN);
+    assert(hml_dispatch(&c,packet)==HML_NOT_INTERCEPTED);
+
     packet=(HMLAxisPacket){0,0};c=make_call(&f,14,7,HML_CONTROLLER_HUMAN);
     assert(hml_dispatch(&c,packet)==HML_NOT_INTERCEPTED&&f.original_calls==0);
 
@@ -70,6 +90,6 @@ int main(void) {
     c=make_call(&f,14,7,HML_CONTROLLER_HUMAN);
     assert(hml_dispatch(&c,(HMLAxisPacket){6,-12})==HML_ORIGINAL_ONLY);
     assert(f.original_calls==1&&f.pitch_calls==1&&f.yaw_calls==0);
-    puts("PASS: native aim wrapper dispatch, original-call count, context gates, axis preservation");
+    puts("PASS: native aim wrapper covers modes 14/17 and weapons 1..80 except the two original camera branches");
     return 0;
 }

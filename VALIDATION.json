@@ -59,7 +59,7 @@
   },
   "game_executable_or_full_archives_bundled": false,
   "native_body_experiment": {
-    "installed": true,
+    "installed": false,
     "physical_game_tested": true,
     "asi_sha256": "97e58e9029db4f3d427e39b7529f13d358c31eb876d400b737bac117b2bafcf7",
     "production_input_fixture_groups": 13,
@@ -75,10 +75,11 @@
     "protected_core_files": 10,
     "original_archives": 140,
     "HD_pages": 24,
-    "owner_game_test": "accepted body turn and chase camera; owner requested aim inversion, 3x sensitivity and wider scope mask"
+    "owner_game_test": "accepted body turn and chase camera; owner requested aim inversion, 3x sensitivity and wider scope mask",
+    "status": "historical owner-accepted body/chase revision; superseded by native-menu v2"
   },
   "mouse_live_tuning": {
-    "installed_on_owner_mac": true,
+    "installed_on_owner_mac": false,
     "source": "experiments/native-body",
     "asi_sha256": "33d1fe4f51f818d966e16ebbaf47e8fed26c54a9147293b93fabf38ce4a255a7",
     "production_input_fixture_groups": 19,
@@ -95,7 +96,8 @@
     "INI_live_reload_after_button_release": "passed Windows API console fixture",
     "included_in_0_5_installers": false,
     "native_game_menu_settings": false,
-    "physical_result": "Owner reports sensitivity increase not perceptible; nominal small-motion gain still saturates old native/digital consumers."
+    "physical_result": "Owner reports sensitivity increase not perceptible; nominal small-motion gain still saturates old native/digital consumers.",
+    "status": "historical nominal-gain revision; superseded by native-menu v2"
   },
   "mac_mouse_settings": {
     "source": "src/mac-settings",
@@ -123,19 +125,47 @@
     "game_launched_for_install": false
   },
   "native_menu_candidate": {
-    "installed_on_owner_mac": false,
+    "installed_on_owner_mac": true,
     "source": "experiments/native-menu",
-    "asi_sha256": "22b481da04ab9fd3e263f5ceac2ec92701b3ac837400d2cd853728df9b042ae3",
+    "asi_sha256": "225d7a31ea82fa5b4f88139709194a940252598739dbf272b80207de48afd19d",
     "physical_game_tested": false,
     "no_game_launched_for_validation": true,
-    "native_options_renderer": "Original FE17/21–23 plus fourth Mouse row drawn through native bitmap font; cached row visibility not assumed",
-    "menu_ini_range": [
+    "native_options_renderer": "Original FE17/21–23 plus fourth Mouse row drawn through native bitmap font; actual game display pending",
+    "body_menu_percent_range": [
+      25,
+      600
+    ],
+    "aim_menu_percent_range": [
       25,
       1000
     ],
+    "body_effective_gain": 3,
+    "body_native_old_peak": 30,
+    "body_new_peak_at_gain12": 90,
+    "native_body_bridge_ABI_suite": "passed isolated Wine CUI, original return/native method once preserved",
+    "input_CUI_groups": 22,
+    "axis_CUI_groups": 7,
+    "native_UI_CUI_groups": 26,
+    "config_reload_regression_groups": 19,
+    "aim_retail_handler_emulation_cases": 320,
+    "ordinary_native_aim_cases": 312,
+    "native_scope_zoom_ids_unchanged": [
+      11,
+      64
+    ],
     "conditional_wait_guard": "Existing native wait phase only, release then fresh press",
-    "linear_aim_enabled_by_default": false,
-    "linear_aim_limit": "Mode14/weapon7; local token decoder incompatible with remote peers when enabled",
-    "included_in_0_5_installers": false
+    "linear_aim_enabled_by_default": true,
+    "session_guard": "Verified manager+4AD byte; local clear permits enhancement, active or unknown retains native synchronized input",
+    "network_wire_changed": false,
+    "two_computer_match_tested": false,
+    "INI_symlink_fixture": "Native Windows reparse validation outstanding; Wine did not expose its fake symlink",
+    "included_in_0_5_installers": false,
+    "post_install_integrity": {
+      "core_files": 10,
+      "original_archives": 140,
+      "HD_pages": 24,
+      "result": "passed"
+    },
+    "self_contained_source_rebuild_same_ASI": true
   }
 }

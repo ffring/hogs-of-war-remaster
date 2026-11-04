@@ -1,42 +1,63 @@
 {
-  "status": "staged_not_installed",
-  "asi_sha256": "22b481da04ab9fd3e263f5ceac2ec92701b3ac837400d2cd853728df9b042ae3",
-  "self_contained_public_source_rebuild_same_ASI": true,
+  "pass": true,
   "no_game_launched": true,
-  "installed_asi_unchanged": true,
-  "input_regression_groups": 19,
-  "axis_CUI_groups": 7,
-  "release_ASI_load": true,
-  "native_UI_CUI": {
-    "menu_bridge": {
+  "asi_sha256": "225d7a31ea82fa5b4f88139709194a940252598739dbf272b80207de48afd19d",
+  "physical_game_tested": false,
+  "isolated_console_checks": {
+    "body": {
       "rc": 0,
-      "pass_lines": 43,
-      "unsupported": []
+      "exe_sha256": "3df73798e56f45cb1deb35b84f8465f237e18f53f549db275cf46916e416dc48",
+      "pass_groups": 0,
+      "pass_suite": true,
+      "counter_note": "Harness prints PASS: instead of PASS-space, so pass_groups is not a suite count; rc0 and explicit suite result passed."
     },
-    "runtime": {
+    "axis": {
       "rc": 0,
-      "pass_lines": 25,
-      "unsupported": []
+      "exe_sha256": "db974ebdb7f1f7d38e3372b58e0a0b7f0e918181ca978b74046556e3981bd587",
+      "pass_groups": 7
+    },
+    "input": {
+      "rc": 0,
+      "exe_sha256": "60885c45910d819291c98c9a7686498e0afc529c9faad739be535696c825fb6f",
+      "pass_groups": 22
+    },
+    "ui": {
+      "rc": 0,
+      "exe_sha256": "67428abdea0684c3860d98237e9d094dff4cdada83a5889fe47323e0486102ba",
+      "pass_groups": 26
     },
     "ini": {
       "rc": 0,
-      "pass_lines": 1,
-      "unsupported": [
-        "UNSUPPORTED symlink test: API reported creation but the reparse point was not observable"
-      ]
+      "exe_sha256": "8a193c9f3a5b151ac1478636e7a41f6b9a917874eb9894cb7c5a576232ef7cf9",
+      "pass_groups": 1
+    },
+    "release_load": {
+      "rc": 0,
+      "exe_sha256": "0b49033a0d9ca5c570288d005e03c94f257cc0684c92cca7ae10ba58dc29cf8b",
+      "pass_groups": 1
     }
   },
-  "native_font_CPU_emulation": {
-    "settings_lines": 13,
-    "settings_glyphs": 114,
-    "options_lines": 7,
-    "options_glyphs": 55,
-    "native_GetText_ret4_and_font_ret12_checked": true,
-    "actual_game_visibility_tested": false
-  },
-  "linear_aim_default_enabled": false,
-  "linear_aim_network_safe_when_enabled": false,
-  "original_body_peak_speed_cap_retained": true,
-  "symlink_validation_on_native_Windows": "outstanding; Wine could not expose its test symlink as a reparse point",
-  "current_russian_font_assets_required": true
+  "config_reload_regression_groups": 19,
+  "body_effective_gain": 3,
+  "body_native_old_peak": 30,
+  "body_new_peak_at_gain12": 90,
+  "body_raw_native_method_emulation": "11 signed deltas -180..180 passed in actual46AF30",
+  "aim_retail_cases": 320,
+  "aim_native_ordinary_cases": 312,
+  "native_scope_zoom_ids_unchanged": [
+    11,
+    64
+  ],
+  "session_guard": "manager51D7C0+4AD readable0 permits local enhancement; nonzero or unknown keeps native input",
+  "source_self_contained": true,
+  "factory_LinearAimEnable": 1,
+  "render_native_font_checks": "13settingslines114glyphs;7Optionslines55glyphs; actualretailGetText/font instructions; in-gamevisualpending",
+  "symlink_fixture_coverage": "NativeWindows reparse validation outstanding; Wine did not expose its fake symlink",
+  "status": "installed_on_owner_mac_physical_test_pending",
+  "installed_on_owner_mac": true,
+  "included_in_0_5_installers": false,
+  "protected_core_files": 10,
+  "original_archives": 140,
+  "HD_pages": 24,
+  "self_contained_public_source_rebuild_same_ASI": true
 }

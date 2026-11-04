@@ -24,18 +24,21 @@ HOGS_WINE_APP='/Applications/Hogs of War Online.app' python3 work/multiplayer/ma
 
 Output: `outputs/Hogs-of-War-Mac-Setup.pkg`. The builder clones the seed to its staging directory, compiles the native launcher, signs the staged app ad hoc and builds an unsigned package. It does not launch Wine or the game. A Developer ID certificate and notarization are not configured.
 
-## Mouse candidate
+## Current mouse module and native settings
 
-The ASI targets 32-bit Windows, including the validated 32-bit Steam executable under Wine. From the repository root:
+The owner-installed ASI targets the pinned 32-bit Steam executable and current Russian font assets. Build its self-contained source with Zig 0.14.1 and a host C compiler:
 
 ```sh
-zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -Isrc/mouse -Wl,--strip-all -shared -o HogsMouse.asi src/mouse/HogsMouse.c -luser32 -lkernel32
-zig cc -target x86-windows-gnu -fms-extensions -std=c11 -O2 -DHOGSMOUSE_TEST -Isrc/mouse -o controlled_aim_harness.exe src/mouse/HogsMouse.c tests/mouse/controlled_aim_harness.c -luser32 -lkernel32
-cc -std=c11 -O2 -Isrc/mouse tests/mouse/controlled_aim_policy_test.c -o controlled_aim_policy_test
-zig cc -target x86-windows-gnu -std=c11 -O2 -Isrc/mouse -o observer_read_harness.exe tests/mouse/observer_read_harness.c -lkernel32
+bash experiments/native-menu/build.sh
+bash experiments/native-menu/native-runtime-v1/tests/build.sh
+bash experiments/native-menu/native-ini-v1/tests/build.sh
 ```
 
-The candidate is not installed by the 0.5 release. The source currently adds a bounded game-state observer to the controlled-RMB mapping; this does not implement the requested chase camera. See [observer.md](docs/observer.md). On macOS it also requires the native focus publisher and matching launcher wiring described in `src/native/README.md`; copying only the ASI is insufficient for the complete Mac focus protection.
+The first script runs portable policy checks and writes `experiments/native-menu/build/HogsMouse-native-menu.asi` plus console fixtures. It does not launch Wine or the game. Run the Windows console fixtures only on Windows or in a separate isolated Wine prefix. [Validation and limitations](experiments/native-menu/VALIDATION.json) distinguish these checks from actual game acceptance.
+
+The current release ASI hash is `225d7a31ea82fa5b4f88139709194a940252598739dbf272b80207de48afd19d`. It includes native body turning, ordinary weapon aiming and in-game Options → Mouse settings. Local enhancements are disabled in active or unknown network sessions; native synchronized input remains in use there. The 0.5 installers do not include this module.
+
+On macOS it also requires the focus publisher and matching launcher wiring described in `src/native/README.md`; copying only the ASI is insufficient for the complete Mac focus protection. `src/mouse`, `tests/mouse` and `experiments/native-body` retain historical revisions for research; they are not the current module.
 
 ## Texture Toolkit adaptation
 

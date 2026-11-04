@@ -13,8 +13,11 @@
 #include "button_state.h"
 #include "observer_read.h"
 #include "native_input_policy.h"
+#include "body_yaw_policy.h"
 #include "aim_scale.h"
 #include "native_axis_bridge.h"
+#include "native_body_bridge.h"
+#include "mouse_tokens.h"
 #include "observer_buffer.h"
 #include "linear_aim_wrapper.h"
 #include "native_aim_bridge.h"
@@ -47,11 +50,19 @@ static HMPollState g_poll_mouse;
 static HMButtonState g_button_state;
 static int g_aim_source;
 static HNPacket g_native_packet;
+static HMTokenRing g_tokens;
+static int g_local_scope_report=-2;
+static int g_last_local_enhancement=-1;
 static int g_native_gain = 12;
 static int g_invert_x = 1;
 static HMLAimScale g_linear_aim_scale = {0,0,300};
-static uint32_t g_linear_axis_word, g_linear_axis_user, g_linear_axis_at;
-static int g_linear_axis_ready, g_linear_aim_installed, g_menu_runtime_ready, g_menu_waiting;
+static int g_linear_aim_installed, g_menu_runtime_ready, g_menu_waiting;
+static int g_native_body_installed;
+static int g_native_body_logged,g_linear_aim_logged;
+static int g_body_desired_pending;
+static int32_t g_body_desired_x;
+static HNBodyYawScale g_body_yaw_scale;
+static uint32_t g_body_pending_serial;
 static BYTE *g_keyboard_callsite;
 static volatile LONG g_keyboard_callsite_state; /* 0 clean, 1 owned, 3 uncertain */
 static HMAimScale g_aim_scale = {0,0,300};
@@ -112,6 +123,10 @@ static int native_gate_allowed(void);
 static void native_refresh_context(BYTE *user);
 static void load_config(void);
 static void refresh_config(void);
+static int local_enhancement_allowed(void);
+static int linear_aim_supported(int mode,int weapon) {
+    return hml_mode_supported(mode) && hml_weapon_supported(weapon);
+}
 static void set_menu_wait_active(int active);
 static void clear_menu_input(void);
 static int native_aim_context_unchanged(void *opaque);
@@ -119,6 +134,7 @@ static int32_t native_aim_original_handler(void *opaque);
 static void native_aim_pitch(void *opaque, int32_t delta);
 static void native_aim_yaw(void *opaque, int32_t delta);
 static int __fastcall native_aim_detour(void *actor, void *edx);
+static void __cdecl native_body_callback(BYTE *actor,BYTE *pig,int32_t *native_delta);
 #ifdef HOGSMOUSE_TEST
 static DWORD g_test_now;
 static uint8_t g_test_buttons;
@@ -126,9 +142,11 @@ static LONG g_test_cursor_x, g_test_cursor_y;
 static int g_test_cursor_valid = 1;
 static int g_test_foreground = 1, g_test_ui, g_test_old_calls;
 static int g_test_native_focus = 1;
+static int g_test_local_game = 1;
 static int g_test_raw_registration_match = 1;
 static volatile LONG g_test_msg_mutations;
 static BYTE *g_test_active_user;
+static BYTE *g_test_actor_ptr,*g_test_pig_ptr,*g_test_camera_ptr;
 static int g_test_battle = 6, g_test_weapon, g_test_cam_mode = 4, g_test_context_valid = 1, g_test_kind;
 #endif
 #include "mac_focus_gate.h"
@@ -401,9 +419,11 @@ static BOOL register_mouse(HWND hwnd) {
 }
 
 static void reset_aim_motion(void) {
+    hmt_clear(&g_tokens);
     hm_aim_scale_clear(&g_aim_scale);
     g_linear_aim_scale.frac_x100_x=g_linear_aim_scale.frac_x100_y=0;
-    g_linear_axis_ready=0; g_linear_axis_word=g_linear_axis_user=g_linear_axis_at=0;
+    g_body_desired_pending=0;g_body_desired_x=0;g_body_pending_serial=0;
+    hn_body_yaw_reset(&g_body_yaw_scale);
     hn_clear(&g_native_packet);
     hm_clear(&g_mouse);
     hm_clear(&g_legacy_mouse);
@@ -568,6 +588,7 @@ static void initialize_native_menu(void) {
         log_line("Mouse settings menu could not start; existing game controls remain available.");
         return;
     }
+    hmn_runtime_set_logger(log_line);
     int install_result=hmn_install();
     if (install_result==1) {
         g_menu_runtime_ready=1;
@@ -768,7 +789,8 @@ static int native_context(BYTE *user, NativeContext *out) {
 #ifdef HOGSMOUSE_TEST
     if (!g_test_context_valid || g_test_battle != 6 || g_test_kind != 0) return 0;
     out->user = (DWORD)(g_test_active_user ? g_test_active_user : user ? user : (BYTE *)1);
-    out->camera = 0x1000; out->weapon = g_test_weapon; out->mode = g_test_cam_mode;
+    out->camera = (DWORD)(uintptr_t)(g_test_camera_ptr ? g_test_camera_ptr : (BYTE *)0x1000);
+    out->weapon = g_test_weapon; out->mode = g_test_cam_mode;
 #else
     DWORD state = 0, battle = 0;
     if (!hogs_observer_read(0x537f24, &state, 4) ||
@@ -802,6 +824,57 @@ static void native_refresh_context(BYTE *user) {
     if (!valid || (g_native_human && g_native_human!=c.user)) clear_and_disarm(NULL);
     if (valid==1) g_native_human=c.user;
 }
+/* Manager flag is set only after successful DirectPlay host/connect and
+   cleared by session teardown. Null/unreadable or nonzero means no local-only
+   enhancement; the existing synchronized native policy remains in charge. */
+static int local_enhancement_allowed(void) {
+#ifdef HOGSMOUSE_TEST
+    int allowed=g_test_local_game!=0;
+#else
+    DWORD manager=0; BYTE active=0xff;
+    int scope=-1;
+    if (hogs_observer_read(0x51d7c0,&manager,4) && manager &&
+        hogs_observer_readable(manager,0x4ae) &&
+        hogs_observer_read(manager+0x4ad,&active,1) && active<=1) scope=(int)active;
+    if (scope!=g_local_scope_report) {
+        g_local_scope_report=scope;
+        log_line(scope==0 ? "Enhanced mouse allowed in local gameplay." :
+                 scope==1 ? "Network session: retaining native synchronized mouse policy." :
+                            "Game session state unavailable: retaining native mouse policy.");
+    }
+    int allowed=scope==0;
+#endif
+    if (!allowed && g_last_local_enhancement!=0) {
+        hmt_clear(&g_tokens);
+        g_body_desired_pending=0;
+        g_body_pending_serial=0;
+        g_linear_aim_scale.frac_x100_x=g_linear_aim_scale.frac_x100_y=0;
+        hn_clear(&g_native_packet);
+    }
+    g_last_local_enhancement=allowed;
+    return allowed;
+}
+
+static int native_capture_token_identity(const NativeContext *c,HMTToken *t,
+                                         uint32_t wire,int route,uint32_t at,
+                                         int x,int y) {
+    if (!c || !t || !c->user || !c->camera || !wire ||
+        (route!=HMT_BODY && route!=HMT_AIM)) return 0;
+    DWORD actor=0,pig=0;
+#ifdef HOGSMOUSE_TEST
+    actor=(DWORD)(uintptr_t)(g_test_actor_ptr ? g_test_actor_ptr : (BYTE *)0x2000);
+    pig=(DWORD)(uintptr_t)(g_test_pig_ptr ? g_test_pig_ptr : (BYTE *)0x3000);
+#else
+    if (!hogs_observer_read(0x537f24,&actor,4) || !actor ||
+        !hogs_observer_read((uintptr_t)c->user+0x10,&pig,4) || !pig) return 0;
+#endif
+    memset(t,0,sizeof(*t));
+    t->user=c->user;t->pig=pig;t->actor=actor;t->camera=c->camera;
+    t->weapon=c->weapon;t->mode=c->mode;t->wire=wire;t->at=at;
+    t->route=route;t->x=x;t->y=y;
+    return 1;
+}
+
 static int native_gate_allowed(void) {
     NativeContext c;
     return native_context(NULL,&c)==1 && g_native_human && c.user==g_native_human;
@@ -838,9 +911,11 @@ static int native_aim_context_unchanged(void *opaque) {
     if (!hogs_observer_read(0x537f24,&state,4) || !hogs_observer_read(0x537f98,&camera,4) ||
         state!=(DWORD)saved->actor || camera!=saved->camera ||
         native_context(NULL,&live)!=1 || live.user!=saved->user || live.camera!=saved->camera ||
-        live.weapon!=HML_WEAPON_SUPPORTED || live.mode!=HML_MODE_AIM ||
+        !linear_aim_supported((int)live.mode,(int)live.weapon) ||
+        !local_enhancement_allowed() ||
         !hogs_observer_read((uintptr_t)saved->actor+0x4fc,&user,4) || user!=saved->user ||
-        !hogs_observer_read((uintptr_t)saved->actor+0x458,&weapon,4) || weapon!=HML_WEAPON_SUPPORTED ||
+        !hogs_observer_read((uintptr_t)saved->actor+0x458,&weapon,4) ||
+        !hml_weapon_supported((int)weapon) ||
         !hogs_observer_read((uintptr_t)saved->actor+0x510,&mode,4) || mode!=6 ||
         !hogs_observer_read((uintptr_t)saved->user+0x10,&pig,4) || pig!=(DWORD)saved->pig ||
         !hogs_observer_read((uintptr_t)saved->pig,&vtable,4) || vtable!=0x004bd298 ||
@@ -851,7 +926,7 @@ static int native_aim_context_unchanged(void *opaque) {
         !native_writable(saved->pig+0x304,2) ||
         !native_writable(saved->actor+0x444,4) ||
         !native_writable(saved->actor+0x440,4)) return 0;
-    if (saved->mode!=HML_MODE_AIM || saved->weapon!=HML_WEAPON_SUPPORTED) return 0;
+    if (!linear_aim_supported((int)saved->mode,(int)saved->weapon)) return 0;
     return 1;
 #else
     (void)opaque; return 0;
@@ -880,13 +955,89 @@ static void native_aim_yaw(void *opaque,int32_t delta) {
     ((YawFn)(uintptr_t)target)(ctx->pig,delta);
 }
 
+static int native_game_read(uintptr_t address,void *out,size_t bytes) {
+#ifdef HOGSMOUSE_TEST
+    uint32_t value=0;
+    if (address==0x537f24u && bytes==4) {
+        value=(uint32_t)(uintptr_t)g_test_actor_ptr;memcpy(out,&value,4);return 1;
+    }
+    if (address==0x537f98u && bytes==4) {
+        value=(uint32_t)(uintptr_t)g_test_camera_ptr;memcpy(out,&value,4);return 1;
+    }
+    /* The fixture uses ordinary heap objects but reproduces the retail
+       executable's pinned pig vtable identity and yaw slot. */
+    if (g_test_pig_ptr && address==(uintptr_t)g_test_pig_ptr && bytes==4) {
+        value=0x004bd298u;memcpy(out,&value,4);return 1;
+    }
+    if (address==0x004bd2b8u && bytes==4) {
+        value=0x0046af30u;memcpy(out,&value,4);return 1;
+    }
+#endif
+    return hogs_observer_read(address,out,bytes);
+}
+
+static void __cdecl native_body_callback(BYTE *actor,BYTE *pig,int32_t *native_delta) {
+    NativeContext c;
+    HMTToken key,token;
+    DWORD state=0,user=0,global_camera=0,mode=0,battle=0,pig_now=0,vtable=0,yaw=0,weapon=0;
+    DWORD axes=0,mask=0;
+    if (!local_enhancement_allowed()) return;
+    if (!g_focused || !is_game_foreground() || game_ui_active()) {
+        hmt_clear(&g_tokens);g_body_desired_pending=0;return;
+    }
+    if (!actor || !pig || !native_delta || !native_writable(native_delta,sizeof(*native_delta)) ||
+        !g_native_body_installed || !g_linear_aim_enabled ||
+#ifndef HOGSMOUSE_TEST
+        !hm_body_bridge_owned() ||
+#endif
+        !g_installed || !g_armed || !g_enabled || g_permanent_failure ||
+        GetCurrentThreadId()!=g_game_thread || !native_game_read(0x537f24,&state,4) ||
+        state!=(DWORD)actor || !native_game_read(0x537f98,&global_camera,4) ||
+        !hogs_observer_read((uintptr_t)actor+0x4fc,&user,4) || !user ||
+        !hogs_observer_read((uintptr_t)actor+0x510,&battle,4) || battle!=6 ||
+        !hogs_observer_read((uintptr_t)actor+0x458,&weapon,4) ||
+        !hogs_observer_read((uintptr_t)global_camera+0x84,&mode,4) || mode!=4 ||
+        !hogs_observer_read((uintptr_t)user+0x10,&pig_now,4) || pig_now!=(DWORD)pig ||
+        !native_game_read((uintptr_t)pig,&vtable,4) || vtable!=0x004bd298 ||
+        !native_game_read(vtable+0x20,&yaw,4) || yaw!=0x0046af30 ||
+        !hogs_observer_read((uintptr_t)actor+0x444,&axes,4) ||
+        !hogs_observer_read((uintptr_t)actor+0x440,&mask,4) || (mask&0x0cu) ||
+        !hogs_observer_readable((uintptr_t)actor,0x514) ||
+        !hogs_observer_readable((uintptr_t)pig,0x308)) return;
+    if (native_context(NULL,&c)!=1 || c.user!=user || c.camera!=global_camera ||
+        c.mode!=4 || !hogs_observer_readable((uintptr_t)user,0x128)) return;
+    int8_t wire_x=(int8_t)(axes&0xffu);
+    int32_t expected=(int32_t)wire_x/4;
+    if (*native_delta!=expected) return;
+    memset(&key,0,sizeof(key));
+    key.user=user;key.pig=(DWORD)pig;key.actor=(DWORD)actor;key.camera=global_camera;
+    key.mode=4;key.weapon=weapon;key.wire=axes&0xffffu;key.route=HMT_BODY;
+    if (!key.wire || !hmt_take(&g_tokens,now_ms(),&key,&token) ||
+        token.x < -180 || token.x > 180) return;
+    /* Recheck volatile identity and the synchronized axes immediately before
+       substituting the stack argument. No angle or actor fields are written. */
+    if (!local_enhancement_allowed() || !g_focused || !is_game_foreground() || game_ui_active()) {
+        hmt_clear(&g_tokens);g_body_desired_pending=0;return;
+    }
+    if (native_context(NULL,&c)!=1 ||
+        c.user!=token.user || c.camera!=token.camera || c.weapon!=token.weapon || c.mode!=4 ||
+        !native_game_read(0x537f24,&state,4) || state!=token.actor ||
+        !hogs_observer_read((uintptr_t)actor+0x444,&axes,4) ||
+        (axes&0xffffu)!=token.wire || !native_writable(native_delta,sizeof(*native_delta))) return;
+    *native_delta=token.x;
+    if (!g_native_body_logged) {
+        g_native_body_logged=1;
+        log_line("Enhanced native body yaw applied.");
+    }
+}
+
 static int __fastcall native_aim_detour(void *actor,void *edx) {
 #ifndef HOGSMOUSE_TEST
     NativeAimCallContext context;
+    HMTToken key,token;
     HMLCall call;
     HMLAxisPacket packet;
     DWORD word=0,mask=0,state=0,camera=0,user=0,pig=0,weapon=0,mode=0;
-    DWORD token_word,token_user,token_at;
     int result;
     (void)edx;
     if (!hmna_can_forward() || !actor) return 0;
@@ -894,27 +1045,28 @@ static int __fastcall native_aim_detour(void *actor,void *edx) {
        cache/rollback state. Keep forwarding through its retained trampoline,
        and never apply the custom axis path unless the hook is fully owned. */
     if (hmna_current_state()!=2 || !hmna_owned()) return hmna_original_handler(actor);
-    if (!g_linear_axis_ready) return hmna_original_handler(actor);
-    token_word=g_linear_axis_word; token_user=g_linear_axis_user; token_at=g_linear_axis_at;
-    g_linear_axis_ready=0; /* one-use token, even if a later guard rejects it */
-    if ((DWORD)(now_ms()-token_at)>100 ||
+    if (!g_linear_aim_enabled || !g_linear_aim_installed || !local_enhancement_allowed() ||
         !hogs_observer_read(0x537f24,&state,4) || state!=(DWORD)actor ||
         !hogs_observer_read((uintptr_t)actor+0x444,&word,4) ||
         !hogs_observer_read((uintptr_t)actor+0x440,&mask,4) ||
-        !hogs_observer_read((uintptr_t)actor+0x4fc,&user,4) || user!=token_user ||
+        !hogs_observer_read((uintptr_t)actor+0x4fc,&user,4) ||
         !hogs_observer_read(0x537f98,&camera,4) ||
         !hogs_observer_read((uintptr_t)actor+0x458,&weapon,4) ||
         !hogs_observer_read((uintptr_t)camera+0x84,&mode,4) ||
-        !hogs_observer_read((uintptr_t)user+0x10,&pig,4))
+        !hogs_observer_read((uintptr_t)user+0x10,&pig,4) || !pig)
         return hmna_original_handler(actor);
-    packet.x=(int8_t)(token_word&0xffu);
-    packet.y=(int8_t)((token_word>>8)&0xffu);
-    if ((word&0xffffu)!=token_word || !native_writable((BYTE *)actor+0x444,4) ||
+    memset(&key,0,sizeof(key));
+    key.user=user;key.pig=pig;key.actor=(DWORD)actor;key.camera=camera;
+    key.weapon=weapon;key.mode=mode;key.wire=word&0xffffu;key.route=HMT_AIM;
+    if (!key.wire || !hml_weapon_supported((int)weapon) || !hml_mode_supported((int)mode) ||
+        !hmt_take(&g_tokens,now_ms(),&key,&token)) return hmna_original_handler(actor);
+    packet.x=(int8_t)token.x;packet.y=(int8_t)token.y;
+    if (hml_pack(packet)!=key.wire || !native_writable((BYTE *)actor+0x444,4) ||
         !native_writable((BYTE *)actor+0x440,4)) return hmna_original_handler(actor);
     memset(&context,0,sizeof(context));
     context.actor=(BYTE *)actor; context.pig=(BYTE *)(uintptr_t)pig;
     context.user=user; context.camera=camera; context.weapon=weapon; context.mode=mode;
-    context.axis_word=word; context.axis_user=token_user; context.axis_at=token_at;
+    context.axis_word=word; context.axis_user=token.user; context.axis_at=token.at;
     memset(&call,0,sizeof(call));
     call.mode=(int)mode; call.weapon=(int)weapon; call.controller_kind=HML_CONTROLLER_HUMAN;
     call.axes_word=(uint32_t *)((BYTE *)actor+0x444);
@@ -922,9 +1074,13 @@ static int __fastcall native_aim_detour(void *actor,void *edx) {
     call.opaque=&context; call.context_unchanged=native_aim_context_unchanged;
     call.original_handler=native_aim_original_handler;
     call.pitch_delta=native_aim_pitch; call.yaw_delta=native_aim_yaw;
+    if (!linear_aim_supported((int)mode,(int)weapon) || !local_enhancement_allowed())
+        return hmna_original_handler(actor);
     result=hml_dispatch(&call,packet);
-    g_linear_axis_ready=0;
     if (result==HML_NOT_INTERCEPTED) return hmna_original_handler(actor);
+    if (result==HML_AIM_APPLIED && !g_linear_aim_logged) {
+        g_linear_aim_logged=1;log_line("Enhanced native weapon aim applied.");
+    }
     return call.original_result; /* statuses 1 and 2 both mean original already ran once */
 #else
     (void)actor;(void)edx;return 0;
@@ -933,28 +1089,54 @@ static int __fastcall native_aim_detour(void *actor,void *edx) {
 
 static void __cdecl native_packet_callback(BYTE *user, DWORD *axes, DWORD *mask) {
     NativeContext c;
+    int local_allowed=local_enhancement_allowed();
+    /* Observe DirectPlay scope even between mouse packets so a transition
+       clears any buffered local-only token before a later native callback. */
     if (!g_native_packet.ready) return;
+    int context_status=native_context(user,&c);
+    /* Other device/controller objects share the game callback. They do not
+       own this pending packet and must not clear its token or native state. */
+    if (context_status<0) return;
+    if (context_status!=1 || !axes || !mask || !native_writable(axes,4) ||
+        !native_writable(mask,4)) {
+        hn_clear(&g_native_packet);hmt_clear(&g_tokens);g_body_desired_pending=0;return;
+    }
     int linear_aim = g_native_packet.route==HN_AIM && g_linear_aim_enabled && g_linear_aim_installed &&
+        local_allowed && linear_aim_supported((int)g_context_mode,(int)g_context_weapon) &&
         (g_native_packet.x!=0 || g_native_packet.y!=0);
     if (!g_installed || !g_armed || !g_enabled || g_permanent_failure ||
         GetCurrentThreadId()!=g_game_thread || !g_focused || !is_game_foreground() ||
-        game_ui_active() || native_context(user,&c)!=1 ||
+        game_ui_active() ||
         c.user!=g_context_user || c.camera!=g_context_camera ||
         c.weapon!=g_context_weapon || c.mode!=g_context_mode ||
         ((c.weapon && (g_button_state.held & HM_MOUSE_RIGHT)) &&
-         !(linear_aim && c.weapon==HML_WEAPON_SUPPORTED && c.mode==HML_MODE_AIM)) ||
-        !native_writable(axes,4) || !native_writable(mask,4)) {
-        hn_clear(&g_native_packet); g_linear_axis_ready=0; return;
+         !(linear_aim && linear_aim_supported((int)c.mode,(int)c.weapon)))) {
+        hn_clear(&g_native_packet);hmt_clear(&g_tokens);g_body_desired_pending=0;return;
     }
     uint32_t packed=0, buttons=0;
-    if (hn_take(&g_native_packet,(DWORD)user,now_ms(),*axes,*mask,&packed,&buttons)) {
+    uint32_t input_mask=*mask;
+    if (hn_take(&g_native_packet,(DWORD)user,now_ms(),*axes,input_mask,&packed,&buttons)) {
         *axes=packed; *mask=buttons;
-        if (linear_aim && c.weapon==HML_WEAPON_SUPPORTED && c.mode==HML_MODE_AIM) {
-            g_linear_axis_word=packed; g_linear_axis_user=(DWORD)user;
-            g_linear_axis_at=now_ms(); g_linear_axis_ready=packed!=0;
-        } else g_linear_axis_ready=0;
+        HMTToken token;
+        if (linear_aim && g_native_packet.route==HN_AIM &&
+            linear_aim_supported((int)c.mode,(int)c.weapon) &&
+            native_capture_token_identity(&c,&token,packed&0xffffu,HMT_AIM,now_ms(),
+                                          g_native_packet.x,g_native_packet.y)) {
+            hmt_push(&g_tokens,&token);
+        } else if (g_native_packet.route==HN_BODY && g_native_body_installed &&
+                   local_enhancement_allowed() && c.mode==4 &&
+                   !(input_mask&0x0cu) && g_body_desired_pending &&
+                   g_body_pending_serial==g_native_packet.serial &&
+                   native_capture_token_identity(&c,&token,packed&0xffffu,HMT_BODY,now_ms(),
+                                                g_body_desired_x,0)) {
+            hmt_push(&g_tokens,&token);
+        }
+        if (g_native_packet.route==HN_BODY) g_body_desired_pending=0;
     } else {
-        g_linear_axis_ready=0;
+        /* If the game supplied its own joystick/keyboard axis, never leave a
+           previously staged local token available for a later matching byte. */
+        hmt_clear(&g_tokens);
+        g_body_desired_pending=0;
     }
 }
 
@@ -988,11 +1170,10 @@ static int merge_mouse(BYTE *buf, BYTE *user) {
         source==HM_SOURCE_POLL ? &g_poll_mouse.mouse : NULL;
     HMState no_motion={0}; if (!state) state=&no_motion;
     uint16_t mask=hm_button_state_take_fire(&g_button_state);
-    if (aiming && context.mode==HML_MODE_AIM && context.weapon==HML_WEAPON_SUPPORTED &&
-        g_linear_aim_enabled && g_linear_aim_installed) {
-        /* Mode 14 / weapon 7 has a proven synchronized X→yaw, Y→pitch path.
-           Keep the native L1 hold and LMB Cross separately; never emit digital
-           directional keys on this linear route. */
+    if (aiming && linear_aim_supported((int)context.mode,(int)context.weapon) &&
+        g_linear_aim_enabled && g_linear_aim_installed && local_enhancement_allowed()) {
+        /* Modes 14/17 and ordinary weapon IDs 1..80 share the proven native
+           X→yaw, Y→pitch sinks. Special camera weapons keep their retail path. */
         if (state->last_motion_ms && (DWORD)(now-state->last_motion_ms)>100) {
             state->dx=state->dy=0;
             g_linear_aim_scale.frac_x100_x=g_linear_aim_scale.frac_x100_y=0;
@@ -1002,7 +1183,6 @@ static int merge_mouse(BYTE *buf, BYTE *user) {
         hn_stage(&g_native_packet,(DWORD)user,now,HN_AIM,packet.x,packet.y,1,0);
         state->dx=state->dy=state->remainder_dx=state->remainder_dy=0;
         mask|=HM_L1; DIAG_INC(aim_l1);
-        g_linear_axis_ready=0;
     } else if (aiming) {
         /* Other weapon/mode combinations retain the previously verified
            digital aim path until their native analog route is independently proven. */
@@ -1019,11 +1199,17 @@ static int merge_mouse(BYTE *buf, BYTE *user) {
         if (aim & HM_UP) DIAG_INC(aim_up); if (aim & HM_DOWN) DIAG_INC(aim_down);
         if (aim & HM_LEFT) DIAG_INC(aim_left); if (aim & HM_RIGHT) DIAG_INC(aim_right);
         if (aim & HM_L1) DIAG_INC(aim_l1);
-        hn_clear(&g_native_packet); g_linear_axis_ready=0;
+        hn_clear(&g_native_packet);
     } else {
         int dx=state->dx;
         if (state->last_motion_ms && (DWORD)(now-state->last_motion_ms)>100) dx=0;
         hn_stage(&g_native_packet,(DWORD)user,now,HN_BODY,dx,0,g_native_gain,0);
+        g_body_desired_pending=0;
+        if (g_linear_aim_enabled && g_native_body_installed && local_enhancement_allowed() && context.mode==4) {
+            g_body_desired_x=hn_body_yaw_step(&g_body_yaw_scale,dx,g_native_gain);
+            g_body_pending_serial=g_native_packet.serial;
+            g_body_desired_pending=g_native_packet.ready!=0 && g_body_desired_x!=0;
+        }
         state->dx=state->dy=state->remainder_dx=state->remainder_dy=0;
         /* RMB with no weapon never requests the independent orbit camera. */
     }
@@ -1195,7 +1381,7 @@ static void load_config(void) {
     if (aim_percent < 25) aim_percent = 25;
     if (aim_percent > 1000) aim_percent = 1000;
     hm_aim_scale_init(&g_aim_scale,aim_percent);
-    g_linear_aim_enabled=GetPrivateProfileIntA("Mouse","LinearAimEnable",0,ini)!=0;
+    g_linear_aim_enabled=GetPrivateProfileIntA("Mouse","LinearAimEnable",1,ini)!=0;
     g_linear_aim_scale.frac_x100_x=g_linear_aim_scale.frac_x100_y=0;
     g_linear_aim_scale.sensitivity_percent=aim_percent;
     int configured_rmb = GetPrivateProfileIntA("Mouse", "RequireRightButton", 1, ini) != 0;
@@ -1238,6 +1424,29 @@ void hm_test_set_native_context(BYTE *u,int battle,int weapon,int mode) {
     g_test_active_user=u;g_test_battle=battle;g_test_weapon=weapon;g_test_cam_mode=mode;
 }
 void hm_test_set_native_kind(int kind) { g_test_kind=kind; }
+void hm_test_set_local_game(int allowed) { g_test_local_game=allowed!=0; }
+void hm_test_set_linear_aim_installed(int installed) {
+    g_linear_aim_enabled=1;g_linear_aim_installed=installed!=0;
+}
+void hm_test_set_body_installed(int installed) { g_native_body_installed=installed!=0; }
+void hm_test_set_world(BYTE *actor,BYTE *pig,BYTE *camera) {
+    g_test_actor_ptr=actor;g_test_pig_ptr=pig;g_test_camera_ptr=camera;
+}
+void hm_test_body_apply(BYTE *actor,BYTE *pig,int32_t *delta) {
+    native_body_callback(actor,pig,delta);
+}
+int hm_test_body_logged(void) { return g_native_body_logged; }
+int hm_test_take_token(uint32_t user,uint32_t pig,uint32_t actor,uint32_t camera,
+                       uint32_t weapon,uint32_t mode,uint32_t wire,int route,
+                       int *x,int *y) {
+    HMTToken key,out;
+    memset(&key,0,sizeof(key));key.user=user;key.pig=pig;key.actor=actor;
+    key.camera=camera;key.weapon=weapon;key.mode=mode;key.wire=wire;key.route=route;
+    if (!hmt_take(&g_tokens,now_ms(),&key,&out)) return 0;
+    if (x) *x=out.x;if (y) *y=out.y;
+    return 1;
+}
+unsigned hm_test_token_count(void) { return g_tokens.count; }
 void hm_test_set_tuning(int gain,int percent,int invert_x,int invert_y) {
     g_native_gain=gain;hm_aim_scale_init(&g_aim_scale,percent);g_invert_x=invert_x;g_invert_y=invert_y;
 }
@@ -1254,10 +1463,15 @@ void hm_test_reset_state(void) {
     memset(&g_mouse, 0, sizeof(g_mouse)); memset(&g_legacy_mouse, 0, sizeof(g_legacy_mouse));
     hm_button_state_clear(&g_button_state);
     hn_clear(&g_native_packet); g_native_gain=4;g_native_human=0;
+    hmt_clear(&g_tokens);g_test_local_game=1;g_local_scope_report=-2;g_last_local_enhancement=-1;
+    g_native_body_installed=g_linear_aim_installed=g_linear_aim_enabled=0;
+    g_native_body_logged=g_linear_aim_logged=0;g_body_desired_pending=0;
+    g_body_desired_x=0;g_body_pending_serial=0;hn_body_yaw_reset(&g_body_yaw_scale);
     hm_aim_scale_init(&g_aim_scale,100);g_invert_x=0;
     g_cfg_loaded=0;g_ini_path[0]=0;g_cfg_file_known=0;g_cfg_poll_at=0;
     g_context_user=g_context_camera=g_context_weapon=g_context_mode=0;g_context_route=HN_NONE;
-    g_test_active_user=NULL;g_test_battle=6;g_test_weapon=0;g_test_cam_mode=4;g_test_context_valid=1;g_test_kind=0;
+    g_test_active_user=NULL;g_test_actor_ptr=g_test_pig_ptr=g_test_camera_ptr=NULL;
+    g_test_battle=6;g_test_weapon=0;g_test_cam_mode=4;g_test_context_valid=1;g_test_kind=0;
     hm_poll_reset(&g_poll_mouse);
     g_hwnd = (HWND)1; g_game_thread = GetCurrentThreadId();
     g_enabled = g_installed = g_armed = g_focused = 1;
@@ -1389,12 +1603,20 @@ static void try_initialize(void) {
         }
     }
     if (g_linear_aim_enabled) {
+        int body_install=hm_body_bridge_install(GetModuleHandleA(NULL),native_body_callback);
+        g_native_body_installed=(body_install==HM_BODY_COMMITTED && hm_body_bridge_owned());
+        if (body_install<0)
+            log_line("Body-yaw hook entered a safe forwarding-only state; local boost is disabled.");
+        else if (g_native_body_installed)
+            log_line("Native body-yaw hook is ready for local gameplay.");
+        else
+            log_line("Body-yaw hook unavailable; native keyboard turning remains active.");
         int aim_install=hmna_install(GetModuleHandleA(NULL),(void *)native_aim_detour);
         g_linear_aim_installed=(aim_install==1 && hmna_owned());
         if (aim_install<0)
             log_line("Linear aim hook entered a safe forwarding-only state; custom aim is disabled.");
         else if (g_linear_aim_installed)
-            log_line("Experimental linear aim route enabled for camera mode 14 and weapon 7.");
+            log_line("Experimental linear aim route enabled for ordinary weapons in camera modes 14/17.");
         else
             log_line("Linear aim hook unavailable; existing digital aiming remains active.");
     } else {
@@ -1412,6 +1634,10 @@ static void try_initialize(void) {
             unregister_mouse();
         } else {
             (void)hm_native_bridge_uninstall();
+            if (g_native_body_installed) {
+                int body_restore=hm_body_bridge_uninstall();
+                if (body_restore==HM_BODY_COMMITTED) g_native_body_installed=0;
+            }
             unregister_mouse();
             g_permanent_failure=1;
         }
